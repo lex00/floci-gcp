@@ -1,0 +1,162 @@
+name: GHCR Publish
+
+# Fork-only automation (lex00/floci-gcp), never sent upstream. Publishes
+# ghcr.io/lex00/floci-gcp on every push to main and on version tag pushes, so
+# the fork's fixes are pullable by digest without waiting on a tagged release.
+# Ported from lex00/floci's ghcr-publish.yml. Upstream's release.yml and
+# nightly.yml push to Docker Hub with secrets this fork does not have; they are
+# left as they are. Builds the JVM image from docker/Dockerfile, multi-arch by
+# digest then merged, so amd64 CI hosts and arm64 Macs both pull the result.
+# Uses the standard GITHUB_TOKEN with packages: write, no additional secrets.
+#
+# Published tags:
+#   main push:  ghcr.io/lex00/floci-gcp:latest   ghcr.io/lex00/floci-gcp:<short-sha>
+#   tag push:   ghcr.io/lex00/floci-gcp:<tag>    ghcr.io/lex00/floci-gcp:<short-sha>
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/floci-gcp
+
+jobs:
+  # Gate: the build/merge jobs below do not run unless the suite is green.
+  #
+  # Duplicates ci.yml's test step (one unsharded `mvn test`) rather than chaining
+  # on CI via workflow_run: ci.yml has no `tags:` trigger and is path-filtered, so
+  # a workflow_run gate would never fire for tag pushes or non-src changes. A
+  # same-run `needs:` cannot be bypassed. Cost: `mvn test` runs twice on a push
+  # to main that touches src/, accepted for a low-traffic fork.
+  test:
+    name: Test suite (publish gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6.0.1
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      # Read-only: ci.yml is the single writer of this key.
+      - uses: actions/cache/restore@v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Run tests
+        run: mvn test -B
+
+  build:
+    name: build ${{ matrix.platform }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Platform slug
+        id: slug
+        run: echo "value=$(echo '${{ matrix.platform }}' | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=floci-gcp-ghcr-publish-${{ steps.slug.outputs.value }}
+          cache-to: type=gha,scope=floci-gcp-ghcr-publish-${{ steps.slug.outputs.value }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ steps.slug.outputs.value }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags for this push
+        id: tags
+        run: |
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          tags="-t ${{ env.IMAGE }}:${short_sha}"
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tags="${tags} -t ${{ env.IMAGE }}:${{ github.ref_name }}"
+          else
+            tags="${tags} -t ${{ env.IMAGE }}:latest"
+          fi
+          echo "flags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "primary=${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            ${{ steps.tags.outputs.flags }} \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect ${{ env.IMAGE }}:${{ steps.tags.outputs.primary }}

@@ -65,6 +65,8 @@ provider "google" {
   pubsub_custom_endpoint         = "${var.endpoint}/v1/"
   big_query_custom_endpoint      = "${var.endpoint}/bigquery/v2/"
   compute_custom_endpoint        = "${var.endpoint}/compute/v1/"
+  tags_custom_endpoint           = "${var.endpoint}/v3/"
+  tags_location_custom_endpoint  = "${var.endpoint}/v3/"
 
   # Service Usage, Cloud Resource Manager v1 (google_project and the lookup
   # google_project_service performs on every read) and Cloud Billing, which

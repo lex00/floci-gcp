@@ -124,7 +124,47 @@ See [IAM enforcement and limitations](iam.md#opt-in-enforcement).
   are not modelled, so the chain above the parent is unknown.
 - The creation operation is rebuilt from the current project each time it is read, so it
   reflects later updates.
-- Resource Manager v3, folders, organizations, tags and org policies are not implemented.
+- Resource Manager v3 serves tags only (see [Tags](#tags)). Folders, organizations, org
+  policies, tag holds, effective tags and IAM policies on tag keys and values are not
+  implemented.
+
+## Tags
+
+The Resource Manager v3 tags API serves tag keys, tag values and tag bindings over REST
+JSON. The Terraform `google_tags_tag_key`, `google_tags_tag_value`, `google_tags_tag_binding`
+and `google_tags_location_tag_binding` resources reach it with
+`tags_custom_endpoint = "http://localhost:4588/v3/"` and
+`tags_location_custom_endpoint = "http://localhost:4588/v3/"`.
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/v3/tagKeys` | Create. `parent` is `organizations/{id}`, `projects/{id}` or `projects/{number}` |
+| `GET` | `/v3/tagKeys?parent=` | List the keys under a parent |
+| `GET` | `/v3/tagKeys/namespaced?name={parentId}/{shortName}` | Project ID or number |
+| `GET`, `PATCH`, `DELETE` | `/v3/tagKeys/{id}` | `PATCH` updates `description` only; `DELETE` takes `etag` |
+| `POST` | `/v3/tagValues` | Create. `parent` is `tagKeys/{id}` or the key's namespaced name |
+| `GET` | `/v3/tagValues?parent=` | List the values under a key |
+| `GET` | `/v3/tagValues/namespaced?name={parentId}/{key}/{value}` | |
+| `GET`, `PATCH`, `DELETE` | `/v3/tagValues/{id}` | As for keys |
+| `POST` | `/v3/tagBindings` | `tagValue` or `tagValueNamespacedName`, not both |
+| `GET` | `/v3/tagBindings?parent=` | `parent` is a full resource name |
+| `DELETE` | `/v3/tagBindings/{name}` | The parent may be URL-encoded once or twice |
+| `GET` | `/v3/operations/{id}` | Every create, update and delete returns an Operation that is already `done` |
+
+A key's namespaced name is `{parentId}/{shortName}` and a value's is
+`{parentId}/{keyShortName}/{shortName}`, where a project parent contributes its project ID.
+Lookups by namespaced name also accept the project number.
+
+A binding parent must exist. Supported parents are projects
+(`//cloudresourcemanager.googleapis.com/projects/{id or number}`), Cloud Storage buckets
+(`//storage.googleapis.com/projects/_/buckets/{bucket}`) and Compute Engine resources
+(`//compute.googleapis.com/projects/{id or number}/...`, by name or numeric ID). Any other
+parent answers `501 UNIMPLEMENTED`. Listing bindings by parent matches a project by ID or
+number.
+
+Deleting a key that still has values, or a value that still has bindings, fails with
+`FAILED_PRECONDITION`. A stale `etag` on update or delete fails with `ABORTED`. These
+status codes follow the method descriptions and AIP-154; the message text is floci-gcp's.
 
 ## Quick Start
 

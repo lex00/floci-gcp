@@ -36,10 +36,10 @@ class ComputeWorkloadIntegrationTest extends ComputeTestSupport {
     }
     @Test void sharedCoreE2MachineTypes() throws Exception {
         String root = root(), zone = "/zones/us-central1-a";
-        for (var expected : List.of(List.of("e2-micro", 1024), List.of("e2-small", 2048), List.of("e2-medium", 4096))) {
-            JsonPath type = given().get(root + zone + "/machineTypes/" + expected.get(0)).then().statusCode(200).extract().jsonPath();
+        for (Map.Entry<String, Integer> expected : Map.of("e2-micro", 1024, "e2-small", 2048, "e2-medium", 4096).entrySet()) {
+            JsonPath type = given().get(root + zone + "/machineTypes/" + expected.getKey()).then().statusCode(200).extract().jsonPath();
             assertEquals(2, type.getInt("guestCpus"));
-            assertEquals(expected.get(1), type.getInt("memoryMb"));
+            assertEquals(expected.getValue(), type.getInt("memoryMb"));
             assertTrue(type.getBoolean("isSharedCpu"));
         }
         assertFalse(given().get(root + zone + "/machineTypes/e2-standard-2").jsonPath().getBoolean("isSharedCpu"));

@@ -26,6 +26,18 @@ class ComputeContractTest {
             assertThat(accelerators.get(project, zone, "nvidia-l4-vws").getName()).isEqualTo("nvidia-l4-vws");
         }
     }
+    @Test void e2SharedCoreMachineTypesMatchDocumentedShape() throws Exception {
+        String project = TestFixtures.uniqueName("java-e2"), zone = "us-central1-a";
+        try (MachineTypesClient machines = MachineTypesClient.create(MachineTypesSettings.newBuilder().setEndpoint(endpoint()).setCredentialsProvider(NoCredentialsProvider.create()).build())) {
+            MachineType small = machines.get(project, zone, "e2-small");
+            assertThat(small.getGuestCpus()).isEqualTo(2);
+            assertThat(small.getMemoryMb()).isEqualTo(2048);
+            assertThat(small.getIsSharedCpu()).isTrue();
+            assertThat(machines.get(project, zone, "e2-micro").getMemoryMb()).isEqualTo(1024);
+            assertThat(machines.get(project, zone, "e2-medium").getMemoryMb()).isEqualTo(4096);
+            assertThat(machines.get(project, zone, "e2-standard-2").getIsSharedCpu()).isFalse();
+        }
+    }
     @Test void lifecycleImagesSnapshotsAndRetainedDisks() throws Exception {
         String project = TestFixtures.uniqueName("java-compute"), zone = "us-central1-a";
         NoCredentialsProvider auth = NoCredentialsProvider.create();

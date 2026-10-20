@@ -403,3 +403,64 @@ resource "google_cloud_run_v2_worker_pool" "compat" {
 output "cloud_run_worker_pool_name" {
   value = google_cloud_run_v2_worker_pool.compat.name
 }
+
+# ── Compute Engine ───────────────────────────────────────────────────────────
+# There is no public image catalog, so the instance boots from a blank disk,
+# and e2-small exercises the shared-core machine types.
+
+resource "google_compute_network" "compat" {
+  name                    = "floci-compat-net-tofu"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "compat" {
+  name          = "floci-compat-subnet-tofu"
+  region        = var.region
+  network       = google_compute_network.compat.id
+  ip_cidr_range = "10.20.0.0/24"
+}
+
+resource "google_compute_firewall" "compat" {
+  name          = "floci-compat-fw-tofu"
+  network       = google_compute_network.compat.name
+  source_ranges = ["0.0.0.0/0"]
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22", "443"]
+  }
+}
+
+resource "google_compute_address" "compat" {
+  name   = "floci-compat-addr-tofu"
+  region = var.region
+}
+
+resource "google_compute_disk" "compat" {
+  name = "floci-compat-disk-tofu"
+  zone = "${var.region}-a"
+  size = 10
+}
+
+resource "google_compute_instance" "compat" {
+  name         = "floci-compat-vm-tofu"
+  zone         = "${var.region}-a"
+  machine_type = "e2-small"
+
+  labels = {
+    env = "compat"
+  }
+
+  boot_disk {
+    source      = google_compute_disk.compat.self_link
+    auto_delete = false
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.compat.id
+
+    access_config {
+      nat_ip = google_compute_address.compat.address
+    }
+  }
+}

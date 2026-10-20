@@ -12,7 +12,11 @@ set `FLOCI_GCP_SERVICES_COMPUTE_REGIONS` to a comma-separated list, such as
 `us-central1,europe-west1`. Each listed region keeps its real zones from the catalog. Unset or
 empty serves the whole catalog. Any region or zone outside that set returns `404`.
 Machine, accelerator and disk catalogs are a small deterministic fixture catalog,
-not an assertion of current Google availability, quotas or pricing.
+not an assertion of current Google availability, quotas or pricing. The machine
+catalog includes the E2 shared-core types `e2-micro`, `e2-small` and `e2-medium`.
+
+The Terraform and OpenTofu `google` provider reaches the service with
+`compute_custom_endpoint = "http://localhost:4588/compute/v1/"`.
 
 Resources and operations share a project-scoped checkpoint through StorageFactory.
 Normal writes are validated against a private snapshot before committing. Operation

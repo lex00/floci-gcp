@@ -504,3 +504,34 @@ setup() {
     count=$(tofu state list 2>/dev/null | wc -l | tr -d ' ')
     [ "$count" -ge 20 ]
 }
+
+# ── Compute Engine Spot Checks ────────────────────────────────────────────────
+
+@test "OpenTofu: Compute network, subnetwork and firewall created" {
+    compute="${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}"
+    run gcp_curl "${compute}/global/networks/floci-compat-net-tofu"
+    assert_success
+    run gcp_curl "${compute}/regions/us-central1/subnetworks/floci-compat-subnet-tofu"
+    assert_success
+    assert_output --partial '"ipCidrRange":"10.20.0.0/24"'
+    run gcp_curl "${compute}/global/firewalls/floci-compat-fw-tofu"
+    assert_success
+    assert_output --partial '"443"'
+}
+
+@test "OpenTofu: Compute e2-small instance boots from a blank disk" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}/zones/us-central1-a/instances/floci-compat-vm-tofu")
+    [[ "$result" == *'/machineTypes/e2-small"'* ]]
+    [[ "$result" == *'/disks/floci-compat-disk-tofu"'* ]]
+    [[ "$result" == *'"env":"compat"'* ]]
+}
+
+@test "OpenTofu: Compute instance uses the reserved address" {
+    address=$(gcp_curl "${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}/regions/us-central1/addresses/floci-compat-addr-tofu")
+    [[ "$address" == *'"status":"IN_USE"'* ]]
+}
+
+@test "OpenTofu: Compute resources plan clean after apply" {
+    run tofu plan -detailed-exitcode -input=false -no-color -target=google_compute_instance.compat -target=google_compute_firewall.compat
+    assert_success
+}

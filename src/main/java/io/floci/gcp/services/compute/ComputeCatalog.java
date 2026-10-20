@@ -5,10 +5,13 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.gcp.core.common.LocationCatalog;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 final class ComputeCatalog {
     static final Set<String> COLLECTIONS = Set.of("regions", "zones", "machineTypes", "diskTypes", "acceleratorTypes");
+    private static final List<Map.Entry<String, Integer>> SHARED_CORE_MEMORY_MB =
+            List.of(Map.entry("e2-micro", 1024), Map.entry("e2-small", 2048), Map.entry("e2-medium", 4096));
     private ComputeCatalog() {}
 
     static List<ObjectNode> list(ComputeService.Context c, List<String> regions, LocationCatalog locations) {
@@ -29,10 +32,13 @@ final class ComputeCatalog {
                 }
             });
             case "machineTypes" -> {
+                // E2 shared-core types report 2 guest CPUs and a fixed memory size, not 4 GB per CPU.
+                SHARED_CORE_MEMORY_MB.forEach(e -> result.add(c.object().put("name", e.getKey()).put("guestCpus", 2)
+                        .put("memoryMb", e.getValue()).put("isSharedCpu", true).put("zone", c.scope().substring(6))));
                 for (String name : List.of("e2-standard-2", "n2-standard-4", "n2-standard-8", "g2-standard-4", "g2-standard-8", "c3-standard-4")) {
                     int cpus = Integer.parseInt(name.substring(name.lastIndexOf('-') + 1));
                     ObjectNode r = c.object().put("name", name).put("guestCpus", cpus).put("memoryMb", cpus * 4096)
-                            .put("zone", c.scope().substring(6));
+                            .put("isSharedCpu", false).put("zone", c.scope().substring(6));
                     if (name.startsWith("g2-")) {
                         r.putArray("accelerators").addObject().put("guestAcceleratorType", "nvidia-l4").put("guestAcceleratorCount", 1);
                     }

@@ -2,6 +2,7 @@ package io.floci.gcp.services.gcs;
 
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.services.gcs.model.GcsObjectMeta;
+import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 
 import java.io.ByteArrayInputStream;
@@ -146,6 +147,28 @@ final class GcsMediaResponses {
     private static void addHeaderIfPresent(Response.ResponseBuilder builder, String name, String value) {
         if (value != null && !value.isEmpty()) {
             builder.header(name, value);
+        }
+    }
+
+    /**
+     * Adds the XML API object headers: the stored {@code Content-Disposition}, {@code Content-Language}
+     * and {@code Cache-Control}, then the {@code response-content-disposition} and
+     * {@code response-content-type} query parameters, which replace the matching headers.
+     */
+    static Response withXmlObjectHeaders(Response response, GcsObjectMeta meta,
+            MultivaluedMap<String, String> query) {
+        Response.ResponseBuilder builder = Response.fromResponse(response);
+        setValidHeader(builder, "Content-Disposition", meta.getContentDisposition());
+        setValidHeader(builder, "Content-Language", meta.getContentLanguage());
+        setValidHeader(builder, "Cache-Control", meta.getCacheControl());
+        setValidHeader(builder, "Content-Disposition", query.getFirst("response-content-disposition"));
+        setValidHeader(builder, "Content-Type", query.getFirst("response-content-type"));
+        return builder.build();
+    }
+
+    private static void setValidHeader(Response.ResponseBuilder builder, String name, String value) {
+        if (value != null && !value.isEmpty() && isValidHeaderValue(value)) {
+            builder.header(name, null).header(name, value);
         }
     }
 

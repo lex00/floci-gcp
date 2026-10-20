@@ -506,3 +506,34 @@ setup() {
     count=$(terraform state list 2>/dev/null | wc -l | tr -d ' ')
     [ "$count" -ge 20 ]
 }
+
+# ── Compute Engine Spot Checks ────────────────────────────────────────────────
+
+@test "Terraform: Compute network, subnetwork and firewall created" {
+    compute="${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}"
+    run gcp_curl "${compute}/global/networks/floci-compat-net"
+    assert_success
+    run gcp_curl "${compute}/regions/us-central1/subnetworks/floci-compat-subnet"
+    assert_success
+    assert_output --partial '"ipCidrRange":"10.20.0.0/24"'
+    run gcp_curl "${compute}/global/firewalls/floci-compat-fw"
+    assert_success
+    assert_output --partial '"443"'
+}
+
+@test "Terraform: Compute e2-small instance boots from a blank disk" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}/zones/us-central1-a/instances/floci-compat-vm")
+    [[ "$result" == *'/machineTypes/e2-small"'* ]]
+    [[ "$result" == *'/disks/floci-compat-disk"'* ]]
+    [[ "$result" == *'"env":"compat"'* ]]
+}
+
+@test "Terraform: Compute instance uses the reserved address" {
+    address=$(gcp_curl "${FLOCI_ENDPOINT}/compute/v1/projects/${FLOCI_PROJECT}/regions/us-central1/addresses/floci-compat-addr")
+    [[ "$address" == *'"status":"IN_USE"'* ]]
+}
+
+@test "Terraform: Compute resources plan clean after apply" {
+    run terraform plan -detailed-exitcode -input=false -no-color -target=google_compute_instance.compat -target=google_compute_firewall.compat
+    assert_success
+}

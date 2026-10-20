@@ -207,6 +207,8 @@ public interface EmulatorConfig {
 
         ResourceManagerServiceConfig resourcemanager();
 
+        CloudAssetServiceConfig cloudasset();
+
         CloudBillingServiceConfig cloudbilling();
 
         FirebaseAuthServiceConfig firebaseauth();
@@ -274,6 +276,15 @@ public interface EmulatorConfig {
 
         @WithDefault("floci/floci-duck:latest")
         String defaultImage();
+    }
+
+    interface CloudAssetServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Seconds a new, changed or deleted resource keeps its previous search answer. */
+        @WithDefault("0")
+        int lagSeconds();
     }
 
     interface ResourceManagerServiceConfig {

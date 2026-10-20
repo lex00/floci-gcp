@@ -194,6 +194,9 @@ floci-gcp:
         - telemetry.googleapis.com
     resourcemanager:
       enabled: true
+    cloudasset:
+      enabled: true
+      lag-seconds: 0
     cloudbilling:
       enabled: true
     firebaseauth:

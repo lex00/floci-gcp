@@ -81,6 +81,7 @@ nav:
     - Cloud KMS: services/kms.md
     - IAM: services/iam.md
     - Resource Manager: services/resource-manager.md
+    - Cloud Asset Inventory: services/cloud-asset.md
     - IAM Credentials: services/iam-credentials.md
     - Security Token Service (STS): services/sts.md
     - Managed Kafka: services/managed-kafka.md

@@ -32,6 +32,39 @@ class NessieIamConditionEvaluatorTest {
     }
 
     @Test
+    void matchTagReadsTheEffectiveTagsOfTheResourceUnderEvaluation() {
+        IamResource tagged = IamResource.gcsBucket("tagged");
+        IamTagResolver resolver = new IamTagResolver() {
+            @Override
+            public List<IamTag> effectiveTags(IamResource resource) {
+                return resource.equals(tagged)
+                        ? List.of(new IamTag("estate/fence", "tagKeys/1", "estate/fence/a", "tagValues/2")) : List.of();
+            }
+
+            @Override
+            public String canonicalKey(String namespacedKey) {
+                return namespacedKey.replace("123/", "estate/");
+            }
+        };
+        NessieIamConditionEvaluator evaluator = new NessieIamConditionEvaluator(CLOCK, 4, () -> resolver);
+
+        assertTrue(evaluator.matches(condition("resource.matchTag('estate/fence', 'a')"), tagged));
+        assertTrue(evaluator.matches(condition("resource.matchTag('123/fence', 'a')"), tagged));
+        assertTrue(evaluator.matches(condition("resource.matchTagId('tagKeys/1', 'tagValues/2')"), tagged));
+        assertFalse(evaluator.matches(condition("resource.matchTag('estate/fence', 'b')"), tagged));
+        assertFalse(evaluator.matches(condition("resource.matchTag('estate/fence', 'a')"), IamResource.gcsBucket("other")));
+        assertTrue(evaluator.matches(condition("!resource.matchTag('estate/fence', 'a')"), IamResource.gcsBucket("other")));
+        assertThrows(GcpException.class, () -> evaluator.validate(condition("resource.matchTag('estate/fence')")));
+        assertThrows(GcpException.class, () -> evaluator.validate(condition("resource.hasTag('estate/fence')")));
+    }
+
+    @Test
+    void matchTagWithoutAResolverIsFalse() {
+        NessieIamConditionEvaluator evaluator = new NessieIamConditionEvaluator(CLOCK, 4);
+        assertFalse(evaluator.matches(condition("resource.matchTag('estate/fence', 'a')"), REPORT));
+    }
+
+    @Test
     void supportsBooleanEqualityInequalityAndEndsWith() {
         NessieIamConditionEvaluator evaluator = new NessieIamConditionEvaluator(CLOCK, 4);
         IamCondition condition = condition("resource.name.endsWith('.csv')"

@@ -132,6 +132,14 @@ resource service/type/name, string comparisons and prefixes, logical operators,
 and request-time comparison. The CEL standard library is not enabled.
 The catalog and condition profile are subsets of Google Cloud IAM.
 
+The profile also has `resource.matchTag('{parentId}/{keyShortName}', '{valueShortName}')` and
+`resource.matchTagId('tagKeys/{id}', 'tagValues/{id}')`. They test the effective
+[Resource Manager tags](resource-manager.md#tags) of the resource under evaluation: the values
+bound to its project, replaced key by key by the values bound to the resource itself. A Cloud
+Storage object takes its bucket's tags, and a Compute resource matches bindings by name or numeric
+ID. `parentId` may be the project ID or number. Folders and organizations are not modelled, so
+nothing is inherited from above the project.
+
 ### Remaining limitations
 
 - Object-list conditions authorize the bucket-level `storage.objects.list`

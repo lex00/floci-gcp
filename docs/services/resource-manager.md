@@ -162,6 +162,9 @@ A binding parent must exist. Supported parents are projects
 parent answers `501 UNIMPLEMENTED`. Listing bindings by parent matches a project by ID or
 number.
 
+IAM Conditions can test these tags with `resource.matchTag` and `resource.matchTagId` (see
+[IAM](iam.md#supported-roles-and-conditions)).
+
 Deleting a key that still has values, or a value that still has bindings, fails with
 `FAILED_PRECONDITION`. A stale `etag` on update or delete fails with `ABORTED`. These
 status codes follow the method descriptions and AIP-154; the message text is floci-gcp's.

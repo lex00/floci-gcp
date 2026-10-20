@@ -324,7 +324,7 @@ public class TagService {
                 + ". It must be organizations/{org_id}, projects/{project_id} or projects/{project_number}.");
     }
 
-    private String canonicalNamespacedName(String namespacedName) {
+    String canonicalNamespacedName(String namespacedName) {
         if (namespacedName == null || namespacedName.isBlank() || namespacedName.indexOf('/') < 0) {
             throw GcpException.invalidArgument("Invalid namespaced name: " + namespacedName);
         }

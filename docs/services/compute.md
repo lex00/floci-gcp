@@ -51,6 +51,29 @@ Public interfaces follow the [Compute REST reference](https://docs.cloud.google.
 Credential acceptance retains the emulator's existing auth bypass; resource
 isolation is not IAM enforcement.
 
+## IAM enforcement
+
+With `FLOCI_GCP_SERVICES_IAM_AUTHORIZATION_MODE=enforce`, requests carrying a Floci-issued
+service-account token are evaluated against the project's allow policy. Networks,
+subnetworks, firewalls, regional and global addresses, instances, disks, the region,
+zone and type catalogs, and zone, region and global operations are covered. Each
+method checks the permission its Compute v1 REST reference lists, plus the field-level
+permissions for the fields the emulator resolves: `network` and `subnetwork`
+references, `sourceImage`, `sourceSnapshot` and `sourceDisk`, and `labels`, `metadata`,
+`tags`, `serviceAccounts` and `deletionProtection` on create. An internal address
+checks `createInternal`.
+
+Policies bind at project level and conditions see the resource name, such as
+`projects/p/global/networks/n`, and a type such as `compute.googleapis.com/Network`.
+Compute resources hold no policies of their own. The predefined roles
+`roles/compute.viewer`, `networkViewer`, `networkUser`, `networkAdmin`,
+`securityAdmin`, `instanceAdmin.v1`, `storageAdmin` and `admin` grant the checked
+permissions their published definitions include.
+
+Images, snapshots and the load balancing resources have no mapping, so an evaluated
+caller gets `FAILED_PRECONDITION` for them. Routes and routers are not emulated.
+Anonymous callers and external credentials bypass evaluation.
+
 ## Instances and disks
 
 Zonal instances support insert/get/list/aggregatedList/start/stop/reset/delete,

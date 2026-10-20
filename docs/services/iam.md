@@ -25,6 +25,7 @@ which mode is active and the supported service list.
 | GCS objects | Supported REST JSON and XML reads, writes, updates, deletes, listing, compose, copy, rewrite, move, restore, resumable uploads, and XML multipart uploads |
 | Pub/Sub | REST JSON and gRPC topic, subscription, snapshot, and policy methods; `testIamPermissions` filters its response |
 | Secret Manager | REST JSON and gRPC secret and version operations; see [Secret Manager IAM enforcement](secret-manager.md#iam-enforcement) |
+| Compute Engine | REST JSON networks, subnetworks, firewalls, regional and global addresses, instances, disks, the region, zone and type catalogs, and operations. Images, snapshots and the load balancing resources answer `FAILED_PRECONDITION` for evaluated callers. See [Compute IAM enforcement](compute.md#iam-enforcement) |
 | GCS ACLs and GCS gRPC | **Not IAM-enforced.** Existing downscoped-token CAB checks still apply |
 | IAM service-account/key management, IAM Credentials, Cloud Run jobs, worker pools, instances, invocation and operations, all other services | **Not IAM-enforced**, including any policies those services store |
 
@@ -36,7 +37,7 @@ For plaintext gRPC, Google credentials may refuse an insecure channel before the
 request reaches the emulator; use a fixed authorization header with the SDK's
 no-credentials provider, or use the emulator's TLS transport.
 Anonymous requests and external credentials bypass Resource Manager, Cloud Run,
-Secret Manager, and Pub/Sub evaluation.
+Secret Manager, Pub/Sub and Compute Engine evaluation.
 GCS evaluation treats those callers as anonymous so `allUsers` policies
 work. In enforce mode, an unknown or expired Floci-issued token receives
 `UNAUTHENTICATED`; an evaluated caller without a matching grant receives
@@ -52,8 +53,8 @@ external credentials can still pass without exercising IAM.
 The framework supports child-to-project inheritance and multiple required permission
 checks. Bucket evaluation includes the owning project's policy; the project cannot
 be inferred from the `projects/_/buckets/...` resource name and is read from the
-stored bucket metadata. Pub/Sub resources, Cloud Run services, and Secret Manager
-secrets inherit their project policy. Project bindings do not authorize or restrict
+stored bucket metadata. Pub/Sub resources, Cloud Run services, Secret Manager
+secrets and Compute Engine resources inherit their project policy. Project bindings do not authorize or restrict
 other services without a registered adapter.
 `testIamPermissions` evaluates each requested permission for the same caller and
 resource; missing resources keep the existing empty-result behavior. Disabled

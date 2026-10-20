@@ -7,13 +7,16 @@ import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
 import jakarta.ws.rs.GET;
+import jakarta.ws.rs.HeaderParam;
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 
 import java.util.HashMap;
 import java.util.List;
@@ -24,7 +27,9 @@ import java.util.Map;
  * prefix to avoid colliding with the canonical {@code /v1/projects} path owned by other
  * services. The {@code ServiceRoutingFilter} rewrites canonical SDK/CLI requests
  * (Host {@code container.*}) to this prefix; Terraform/gcloud reach it directly via a
- * {@code /container/v1/} custom endpoint.
+ * {@code /container/v1/} custom endpoint. Every route is served under {@code v1} and
+ * {@code v1beta1}; a v1beta1 request that sets a field only v1beta1 defines answers 400
+ * ({@link GkeBetaFields}), and {@link GkeApiVersionFilter} maps v1beta1 onto these routes.
  *
  * <p>Shapes mirror {@code google.container.v1.Cluster} / {@code NodePool} / {@code Operation}.
  * Path params that precede a GCP "custom method" colon suffix (e.g. {@code :setNetworkPolicy})
@@ -49,12 +54,14 @@ public class KubernetesController {
     @POST
     @Path("/clusters")
     public Response createCluster(
+            @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version,
             @PathParam("project") String project,
             @PathParam("location") String location,
             Map<String, Object> body) {
 
         @SuppressWarnings("unchecked")
         Map<String, Object> clusterMap = body == null ? null : (Map<String, Object>) body.get("cluster");
+        GkeBetaFields.checkCluster(version, clusterMap);
         return Response.ok(gkeService.createCluster(project, location, clusterMap)).build();
     }
 
@@ -83,6 +90,7 @@ public class KubernetesController {
     @PUT
     @Path("/clusters/{clusterId}")
     public Response updateCluster(
+            @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version,
             @PathParam("project") String project,
             @PathParam("location") String location,
             @PathParam("clusterId") String clusterId,
@@ -90,6 +98,7 @@ public class KubernetesController {
 
         @SuppressWarnings("unchecked")
         Map<String, Object> updateMap = body == null ? null : (Map<String, Object>) body.get("update");
+        GkeBetaFields.checkClusterUpdate(version, updateMap);
         return Response.ok(gkeService.updateCluster(project, location, clusterId, updateMap)).build();
     }
 
@@ -290,6 +299,7 @@ public class KubernetesController {
     @POST
     @Path("/clusters/{clusterId}/nodePools")
     public Response createNodePool(
+            @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version,
             @PathParam("project") String project,
             @PathParam("location") String location,
             @PathParam("clusterId") String clusterId,
@@ -297,6 +307,7 @@ public class KubernetesController {
 
         @SuppressWarnings("unchecked")
         Map<String, Object> nodePoolMap = body == null ? null : (Map<String, Object>) body.get("nodePool");
+        GkeBetaFields.checkNodePool(version, nodePoolMap);
         return Response.ok(gkeService.createNodePool(project, location, clusterId, nodePoolMap)).build();
     }
 
@@ -439,6 +450,32 @@ public class KubernetesController {
             @PathParam("clusterId") String clusterId) {
 
         return Response.ok(gkeService.kubeConfig(project, location, clusterId)).build();
+    }
+
+    // ── Unmatched paths ──────────────────────────────────────────────────────
+
+    @GET
+    @Path("/{rest: .+}")
+    public Response unmatchedGet(@Context UriInfo uri, @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version) {
+        throw GkeUnmatchedPathFilter.unmatched(uri.getRequestUri().getRawPath(), version);
+    }
+
+    @POST
+    @Path("/{rest: .+}")
+    public Response unmatchedPost(@Context UriInfo uri, @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version) {
+        throw GkeUnmatchedPathFilter.unmatched(uri.getRequestUri().getRawPath(), version);
+    }
+
+    @PUT
+    @Path("/{rest: .+}")
+    public Response unmatchedPut(@Context UriInfo uri, @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version) {
+        throw GkeUnmatchedPathFilter.unmatched(uri.getRequestUri().getRawPath(), version);
+    }
+
+    @DELETE
+    @Path("/{rest: .+}")
+    public Response unmatchedDelete(@Context UriInfo uri, @HeaderParam(GkeApiVersionFilter.VERSION_HEADER) String version) {
+        throw GkeUnmatchedPathFilter.unmatched(uri.getRequestUri().getRawPath(), version);
     }
 
     private static Map<String, Object> clusterToJson(StoredCluster cluster) {

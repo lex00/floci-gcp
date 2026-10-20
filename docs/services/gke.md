@@ -1,7 +1,7 @@
 # GKE (Kubernetes Engine)
 
 floci-gcp emulates the Google Kubernetes Engine control plane (`container.googleapis.com`,
-ClusterManager v1) over REST JSON. Cluster lifecycle is backed by real
+ClusterManager `v1` and `v1beta1`) over REST JSON. Cluster lifecycle is backed by real
 [k3s](https://k3s.io/) containers (`rancher/k3s`) started through the host Docker daemon,
 or a lightweight mock mode.
 
@@ -53,6 +53,21 @@ everything on one port, where that path also belongs to Managed Kafka, so GKE mo
     The Cloud Client libraries default to gRPC, which the REST-only emulator does not serve
     for GKE. Build the client with the HttpJson transport
     (`ClusterManagerSettings.newHttpJsonBuilder()`) and a `container.*` endpoint host.
+
+## API versions
+
+Every route is served under both `/v1/` and `/v1beta1/`, in host mode and path mode
+(`/container/v1beta1/...`). `v1beta1` is what `terraform-provider-google-beta` and the Pulumi
+`gcp` provider, which is bridged from it, call for every GKE resource.
+
+`v1beta1` requests reach the same handlers as `v1`. A `v1beta1` request that sets a field
+`v1` does not define answers `400 INVALID_ARGUMENT` naming the field, for example
+`cluster.tpuConfig`, `cluster.podSecurityPolicyConfig`, `cluster.nodeConfig.ephemeralStorageConfig`
+or `update.desiredAddonsConfig.istioConfig`. A field left at its default value (`false`, `0`,
+an empty string, an `*_UNSPECIFIED` enum, or an object holding only defaults) counts as unset,
+so the empty blocks `google-beta` sends are accepted. Response `selfLink` values use `/v1/`.
+
+A `/container/...` path that no route serves answers `404 NOT_FOUND` naming the path.
 
 ## Quick Start
 

@@ -24,13 +24,14 @@ import java.net.URI;
  * <ul>
  *   <li><b>Path mode</b> (Terraform/gcloud): if the path already starts with the service's
  *       prefix ({@code /container/}) it is left as-is.</li>
- *   <li><b>Host mode</b> (SDKs): if the path is canonical ({@code /v1/...}) and the first DNS
+ *   <li><b>Host mode</b> (SDKs): if the path is canonical ({@code /v1/...} or
+ *       {@code /v1beta1/...}) and the first DNS
  *       label of the {@code Host}/{@code :authority} header equals the service's
  *       {@code hostToken} ({@code container}), the path is rewritten to prepend the prefix
  *       ({@code /v1/projects/...} → {@code /container/v1/projects/...}).</li>
  * </ul>
  * Requests that match neither are untouched, so IAM/Datastore/SecretManager/GCS keep working.
- * Only {@code /v1/} paths are ever rewritten, so GCS XML/object, {@code /storage}, {@code /v2}
+ * Only {@code /v1/} and {@code /v1beta1/} paths are ever rewritten, so GCS XML/object, {@code /storage}, {@code /v2}
  * and health endpoints are never affected.
  */
 @Provider
@@ -58,7 +59,7 @@ public class ServiceRoutingFilter implements ContainerRequestFilter {
 
         URI original = ctx.getUriInfo().getRequestUri();
         String path = original.getRawPath();
-        if (path == null || !path.startsWith("/v1/")) {
+        if (path == null || !path.startsWith("/v1/") && !path.startsWith("/v1beta1/")) {
             return;
         }
 

@@ -1,7 +1,7 @@
 name: GHCR Publish
 
 # Fork-only automation (lex00/floci-gcp), never sent upstream. Publishes
-# ghcr.io/lex00/floci-gcp on every push to main and on version tag pushes, so
+# ghcr.io/lex00/floci-gcp on every push to develop and on version tag pushes, so
 # the fork's fixes are pullable by digest without waiting on a tagged release.
 # Ported from lex00/floci's ghcr-publish.yml. Upstream's release.yml and
 # nightly.yml push to Docker Hub with secrets this fork does not have; they are
@@ -10,13 +10,13 @@ name: GHCR Publish
 # Uses the standard GITHUB_TOKEN with packages: write, no additional secrets.
 #
 # Published tags:
-#   main push:  ghcr.io/lex00/floci-gcp:latest   ghcr.io/lex00/floci-gcp:<short-sha>
+#   develop push: ghcr.io/lex00/floci-gcp:latest   ghcr.io/lex00/floci-gcp:<short-sha>
 #   tag push:   ghcr.io/lex00/floci-gcp:<tag>    ghcr.io/lex00/floci-gcp:<short-sha>
 
 on:
   push:
     branches:
-      - main
+      - develop
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
 

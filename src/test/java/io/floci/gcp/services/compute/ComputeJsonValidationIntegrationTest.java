@@ -1,5 +1,6 @@
 package io.floci.gcp.services.compute;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.quarkus.test.junit.QuarkusTest;
@@ -17,6 +18,31 @@ class ComputeJsonValidationIntegrationTest extends ComputeTestSupport {
     private void invalid(String path, ObjectNode body) {
         post(path, body.toString()).then().statusCode(400)
                 .body("error.code", equalTo(400)).body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test void typesWithoutLabelsRejectLabelFields() throws Exception {
+        String root = root();
+        for (String field : List.of("labels", "labelFingerprint")) {
+            JsonNode value = field.equals("labels") ? JSON.readTree("{\"env\":\"prod\"}") : JSON.readTree("\"abc\"");
+            ObjectNode network = JSON.createObjectNode().put("name", "net").put("autoCreateSubnetworks", false);
+            invalid(root + "/global/networks", network.set(field, value));
+        }
+        given().get(root + "/global/networks/net").then().statusCode(404);
+        done(root, post(root + "/global/networks", Map.of("name", "net", "autoCreateSubnetworks", false)));
+        invalid(root + "/regions/us-central1/subnetworks", (ObjectNode) JSON.readTree("""
+                {"name":"subnet","network":"global/networks/net","ipCidrRange":"10.9.0.0/24","labels":{"env":"prod"}}
+                """));
+        given().get(root + "/regions/us-central1/subnetworks/subnet").then().statusCode(404);
+        invalid(root + "/global/firewalls", (ObjectNode) JSON.readTree("""
+                {"name":"fw","network":"global/networks/net","allowed":[{"IPProtocol":"tcp","ports":["22"]}],"labels":{"env":"prod"}}
+                """));
+        done(root, post(root + "/global/firewalls", Map.of("name", "fw", "network", "global/networks/net",
+                "allowed", List.of(Map.of("IPProtocol", "tcp", "ports", List.of("22"))))));
+        given().contentType("application/json").body("{\"labels\":{\"env\":\"prod\"}}")
+                .patch(root + "/global/firewalls/fw").then().statusCode(400).body("error.status", equalTo("INVALID_ARGUMENT"));
+        assertFalse(given().get(root + "/global/firewalls/fw").jsonPath().getMap("$").containsKey("labels"));
+        done(root, post(root + "/regions/us-central1/addresses", Map.of("name", "addr", "labels", Map.of("env", "prod"))));
+        assertEquals("prod", given().get(root + "/regions/us-central1/addresses/addr").jsonPath().getString("labels.env"));
     }
 
     @Test void malformedHealthChecksDoNotCreateResourcesOrOperations() throws Exception {

@@ -133,6 +133,10 @@ public class ComputeService {
         return handlers.stream().filter(h -> h.handles(c.collection())).findFirst()
                 .orElseThrow(() -> GcpException.unimplemented("Compute collection not implemented: " + c.collection()));
     }
+    /** A snapshot of the project's resources, keyed by their path under the project. */
+    public synchronized Map<String, ObjectNode> resources(String project) {
+        return Map.copyOf(state(project).resources);
+    }
     public synchronized ObjectNode get(String project, String path, Map<String, String> query) {
         Context c = context(project, path, state(project));
         if (c.collection().equals("operations")) {

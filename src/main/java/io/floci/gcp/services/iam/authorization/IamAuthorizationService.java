@@ -67,7 +67,8 @@ public class IamAuthorizationService {
                         + "Identity handling is service-specific; GCS bucket policies evaluate anonymous callers. "
                         + "Enforce mode covers Cloud Run v2 service/revision REST, service-policy REST and shared IAM gRPC, "
                         + "Secret Manager REST/gRPC, and Compute Engine networks, subnetworks, firewalls, addresses, "
-                        + "instances, disks, catalogs and operations over REST. Cloud Run jobs/instances/worker pools/invocation, "
+                        + "instances, disks, catalogs and operations over REST, and Cloud Asset searchAllResources. "
+                        + "Cloud Run jobs/instances/worker pools/invocation, "
                         + "Compute images, snapshots and load balancing, GCS ACLs, GCS gRPC and all other services are "
                         + "NOT IAM-enforced. "
                         + "GCS Credential Access Boundary checks remain active.",

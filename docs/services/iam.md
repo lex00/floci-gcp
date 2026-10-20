@@ -26,6 +26,7 @@ which mode is active and the supported service list.
 | Pub/Sub | REST JSON and gRPC topic, subscription, snapshot, and policy methods; `testIamPermissions` filters its response |
 | Secret Manager | REST JSON and gRPC secret and version operations; see [Secret Manager IAM enforcement](secret-manager.md#iam-enforcement) |
 | Compute Engine | REST JSON networks, subnetworks, firewalls, regional and global addresses, instances, disks, the region, zone and type catalogs, and operations. Images, snapshots and the load balancing resources answer `FAILED_PRECONDITION` for evaluated callers. See [Compute IAM enforcement](compute.md#iam-enforcement) |
+| Cloud Asset Inventory | REST JSON `searchAllResources`, which also checks `serviceusage.services.use`. See [Cloud Asset IAM](cloud-asset.md#service-usage-and-iam) |
 | GCS ACLs and GCS gRPC | **Not IAM-enforced.** Existing downscoped-token CAB checks still apply |
 | IAM service-account/key management, IAM Credentials, Cloud Run jobs, worker pools, instances, invocation and operations, all other services | **Not IAM-enforced**, including any policies those services store |
 

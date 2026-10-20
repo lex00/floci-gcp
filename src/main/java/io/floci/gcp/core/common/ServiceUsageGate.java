@@ -21,7 +21,8 @@ import java.util.Set;
  * Rejects calls to APIs that are not ENABLED in Service Usage for the caller's project when
  * {@code floci-gcp.services.serviceusage.enforcement-enabled} is on. The error follows
  * {@code google.api.ErrorReason.SERVICE_DISABLED}: 403 PERMISSION_DENIED with an
- * {@code ErrorInfo} (domain {@code googleapis.com}, metadata {@code service} and {@code consumer}).
+ * {@code ErrorInfo} (domain {@code googleapis.com}, metadata {@code service}, {@code consumer} and
+ * {@code activationUrl}).
  */
 @ApplicationScoped
 public class ServiceUsageGate {
@@ -95,15 +96,19 @@ public class ServiceUsageGate {
     static String message(ServiceDescriptor descriptor, String project) {
         return descriptor.apiTitle() + " has not been used in project " + project
                 + " before or it is disabled. Enable it by visiting "
-                + "https://console.developers.google.com/apis/api/" + descriptor.apiName()
-                + "/overview?project=" + project + " then retry. If you enabled this API recently, "
+                + activationUrl(descriptor, project) + " then retry. If you enabled this API recently, "
                 + "wait a few minutes for the action to propagate to our systems and retry.";
+    }
+
+    private static String activationUrl(ServiceDescriptor descriptor, String project) {
+        return "https://console.developers.google.com/apis/api/" + descriptor.apiName() + "/overview?project=" + project;
     }
 
     private static Map<String, String> metadata(ServiceDescriptor descriptor, String project) {
         Map<String, String> metadata = new LinkedHashMap<>();
         metadata.put("service", descriptor.apiName());
         metadata.put("consumer", "projects/" + project);
+        metadata.put("activationUrl", activationUrl(descriptor, project));
         return metadata;
     }
 }

@@ -32,6 +32,9 @@ IPv4 addresses support insert/get/list/delete. Firewalls also support updates.
 Subnet overlap, scope, references, firewall ports and dependent-resource deletion
 are validated. External addresses come from the documentation-only 203.0.113.0/24
 range. Auto-mode VPCs, IPv6, Shared VPC and cross-project references are unsupported.
+Networks, subnetworks, firewalls and the load balancing resources have no `labels` or
+`labelFingerprint` field in Compute v1, so a request body carrying either is refused with
+`400 INVALID_ARGUMENT`.
 
 Global, regional and zonal operations support get/list/wait/delete. A wait may
 return an unfinished operation, which clients must continue polling. Nonzero UUID

@@ -224,6 +224,7 @@ public class ComputeService {
             if (c.scope().startsWith("zones/") && !catalogZone(c.scope().substring(6))) {
                 throw GcpException.notFound("Unknown zone: " + c.scope().substring(6));
             }
+            rejectLabelsOnUnlabelled(c.collection(), body);
             if (c.state.resources.containsKey(c.key())) { throw GcpException.alreadyExists("Resource already exists: " + c.key()); }
             resource = body;
             resource.put("id", Long.toString(++c.state.sequence)).put("kind", "compute#" + singular(c.collection()))
@@ -257,6 +258,7 @@ public class ComputeService {
             } else if (verb.equals("POST") && c.action != null) {
                 handler.action(c, resource, c.action, body, query); operationType = c.action;
             } else if ((verb.equals("PATCH") || verb.equals("PUT")) && c.action == null) {
+                rejectLabelsOnUnlabelled(c.collection(), body);
                 handler.update(c, resource, body, verb); operationType = "update";
             } else { throw GcpException.unimplemented("Unsupported Compute method"); }
         }
@@ -375,6 +377,14 @@ public class ComputeService {
     public static void checkFingerprint(ObjectNode existing, ObjectNode input, String field) {
         if (!existing.path(field).asText().equals(input.path(field).asText()) || !input.hasNonNull(field)) {
             throw GcpException.conditionNotMet("Supplied " + field + " does not match the current resource");
+        }
+    }
+    static void rejectLabelsOnUnlabelled(String collection, JsonNode body) {
+        if (LABELLED.contains(collection)) { return; }
+        for (String field : List.of("labels", "labelFingerprint")) {
+            if (body.has(field)) {
+                throw GcpException.invalidArgument("Invalid JSON payload received. Unknown name \"" + field + "\" at 'resource': Cannot find field.");
+            }
         }
     }
     public static void labels(JsonNode labels) {

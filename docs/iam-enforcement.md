@@ -7,7 +7,8 @@ The global-interceptor annotation also covers Quarkus-managed registrations.
 An annotation alone does not cover the dynamically bound controllers.
 
 Resource Manager projects, Cloud Run v2 services and revisions, Secret Manager
-secrets and versions, Pub/Sub, and GCS bucket/object operations are integrated. Cloud Run
+secrets and versions, Pub/Sub, GCS bucket/object operations, and Compute Engine REST
+operations are integrated. Cloud Run
 service-policy methods use REST and the shared IAM gRPC API. Secret Manager secret
 policy methods work over REST and gRPC. GCS invokes the shared evaluator from its
 service-level authorization path so JSON filtering does not bypass its

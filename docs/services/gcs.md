@@ -279,6 +279,10 @@ URL signedUrl = storage.signUrl(
 ```
 
 Pre-signed URLs are generated using the `FLOCI_GCP_BASE_URL` as the base.
+An XML API object GET returns the object's stored `Content-Disposition`,
+`Content-Language` and `Cache-Control`. Its `response-content-disposition` and
+`response-content-type` query parameters replace `Content-Disposition` and
+`Content-Type`, which is how a signed URL names the downloaded file.
 With IAM authorization in `enforce` mode, signed-URL identity is not evaluated:
 because signatures are not cryptographically verified, these requests are treated
 as anonymous and require an `allUsers` grant. The default `disabled` mode retains

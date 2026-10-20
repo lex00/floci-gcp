@@ -10,6 +10,11 @@ import com.google.cloud.kms.v1.DecryptRequest;
 import com.google.cloud.kms.v1.Digest;
 import com.google.cloud.kms.v1.EncryptRequest;
 import com.google.cloud.kms.v1.KeyManagementServiceGrpc;
+import com.google.cloud.kms.v1.MacSignRequest;
+import com.google.cloud.kms.v1.MacSignResponse;
+import com.google.cloud.kms.v1.MacVerifyRequest;
+import com.google.cloud.kms.v1.MacVerifyResponse;
+import com.google.cloud.kms.v1.ProtectionLevel;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Int64Value;
 import io.grpc.ManagedChannel;
@@ -29,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.zip.CRC32C;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -139,5 +145,53 @@ class CloudKmsGrpcIntegrationTest {
 
         assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
                 () -> kms.asymmetricSign(sign)).getStatus().getCode());
+    }
+
+    @Test
+    void macSignAndMacVerifyRoundTripWithChecksums() {
+        kms.createKeyRing(CreateKeyRingRequest.newBuilder().setParent(LOCATION).setKeyRingId("mac-ring").build());
+        CryptoKey key = kms.createCryptoKey(CreateCryptoKeyRequest.newBuilder()
+                .setParent(LOCATION + "/keyRings/mac-ring").setCryptoKeyId("mac")
+                .setCryptoKey(CryptoKey.newBuilder().setPurpose(CryptoKey.CryptoKeyPurpose.MAC)
+                        .setVersionTemplate(CryptoKeyVersionTemplate.newBuilder()
+                                .setAlgorithm(CryptoKeyVersion.CryptoKeyVersionAlgorithm.HMAC_SHA256)))
+                .build());
+        assertEquals(CryptoKey.CryptoKeyPurpose.MAC, key.getPurpose());
+        assertEquals(CryptoKeyVersion.CryptoKeyVersionAlgorithm.HMAC_SHA256, key.getVersionTemplate().getAlgorithm());
+        String version = key.getName() + "/cryptoKeyVersions/1";
+        ByteString data = ByteString.copyFrom("payload", StandardCharsets.UTF_8);
+
+        MacSignResponse signed = kms.macSign(MacSignRequest.newBuilder().setName(version)
+                .setData(data).setDataCrc32C(Int64Value.of(crc32c(data))).build());
+        assertEquals(version, signed.getName());
+        assertEquals(32, signed.getMac().size());
+        assertEquals(crc32c(signed.getMac()), signed.getMacCrc32C().getValue());
+        assertTrue(signed.getVerifiedDataCrc32C());
+        assertEquals(ProtectionLevel.SOFTWARE, signed.getProtectionLevel());
+
+        MacVerifyRequest verify = MacVerifyRequest.newBuilder().setName(version).setData(data)
+                .setDataCrc32C(Int64Value.of(crc32c(data))).setMac(signed.getMac())
+                .setMacCrc32C(Int64Value.of(crc32c(signed.getMac()))).build();
+        MacVerifyResponse verified = kms.macVerify(verify);
+        assertTrue(verified.getSuccess());
+        assertTrue(verified.getVerifiedSuccessIntegrity());
+        assertTrue(verified.getVerifiedDataCrc32C());
+        assertTrue(verified.getVerifiedMacCrc32C());
+        assertEquals(version, verified.getName());
+        assertEquals(ProtectionLevel.SOFTWARE, verified.getProtectionLevel());
+
+        ByteString otherData = ByteString.copyFrom("other", StandardCharsets.UTF_8);
+        MacVerifyResponse rejected = kms.macVerify(MacVerifyRequest.newBuilder().setName(version)
+                .setData(otherData).setMac(signed.getMac()).build());
+        assertFalse(rejected.getSuccess());
+        assertFalse(rejected.getVerifiedSuccessIntegrity());
+        assertFalse(rejected.getVerifiedDataCrc32C());
+
+        assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
+                () -> kms.macSign(MacSignRequest.newBuilder().setName(version).setData(data)
+                        .setDataCrc32C(Int64Value.of(1)).build())).getStatus().getCode());
+        assertEquals(Status.Code.INVALID_ARGUMENT, assertThrows(StatusRuntimeException.class,
+                () -> kms.macVerify(verify.toBuilder().setMacCrc32C(Int64Value.of(1)).build()))
+                .getStatus().getCode());
     }
 }

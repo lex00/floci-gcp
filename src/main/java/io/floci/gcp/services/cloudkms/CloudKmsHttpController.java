@@ -389,6 +389,56 @@ public class CloudKmsHttpController {
     }
 
     @POST
+    @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions/{version}:macSign")
+    public Response macSign(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey,
+            @PathParam("version") String version, String rawBody) {
+        try {
+            Map<String, Object> body = parseBody(rawBody);
+            byte[] data = decodeField(body, "data");
+            boolean verifiedData = verifyCrc32c(body, "dataCrc32c", data);
+            String name = versionName(project, location, keyRing, cryptoKey, version);
+            byte[] mac = service.macSign(name, data);
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("name", name);
+            response.put("mac", Base64.getEncoder().encodeToString(mac));
+            response.put("macCrc32c", String.valueOf(crc32c(mac)));
+            putIfVerified(response, "verifiedDataCrc32c", verifiedData);
+            response.put("protectionLevel", "SOFTWARE");
+            return Response.ok(response).build();
+        } catch (GcpException e) {
+            return error(e);
+        }
+    }
+
+    @POST
+    @Path("/{location}/keyRings/{keyRing}/cryptoKeys/{cryptoKey}/cryptoKeyVersions/{version}:macVerify")
+    public Response macVerify(@PathParam("project") String project, @PathParam("location") String location,
+            @PathParam("keyRing") String keyRing, @PathParam("cryptoKey") String cryptoKey,
+            @PathParam("version") String version, String rawBody) {
+        try {
+            Map<String, Object> body = parseBody(rawBody);
+            byte[] data = decodeField(body, "data");
+            byte[] mac = decodeField(body, "mac");
+            boolean verifiedData = verifyCrc32c(body, "dataCrc32c", data);
+            boolean verifiedMac = verifyCrc32c(body, "macCrc32c", mac);
+            String name = versionName(project, location, keyRing, cryptoKey, version);
+            boolean success = service.macVerify(name, data, mac);
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("name", name);
+            putIfVerified(response, "success", success);
+            putIfVerified(response, "verifiedDataCrc32c", verifiedData);
+            putIfVerified(response, "verifiedMacCrc32c", verifiedMac);
+            // Repeats success so a client can detect a corrupted success field.
+            putIfVerified(response, "verifiedSuccessIntegrity", success);
+            response.put("protectionLevel", "SOFTWARE");
+            return Response.ok(response).build();
+        } catch (GcpException e) {
+            return error(e);
+        }
+    }
+
+    @POST
     @Path("/{location}:generateRandomBytes")
     public Response generateRandomBytes(@PathParam("project") String project, @PathParam("location") String location,
             Map<String, Object> body) {

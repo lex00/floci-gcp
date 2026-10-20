@@ -13,6 +13,8 @@ floci-gcp:
   default-project-id: test-project
   locations:
     strict: false
+  projects:
+    strict: false
   storage:
     mode: memory
   services:
@@ -47,6 +49,7 @@ floci-gcp:
         cleanup-timeout: 15s
         url-host-suffix:
         max-worker-instances: 1
+        security-opts:
     cloudfunctions:
       enabled: true
     monitoring:
@@ -65,7 +68,10 @@ floci-gcp:
       mock: true
     serviceusage:
       enabled: true
+      enforcement-enabled: false
     resourcemanager:
+      enabled: true
+    cloudbilling:
       enabled: true
     firebaseauth:
       enabled: true

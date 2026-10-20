@@ -1,6 +1,6 @@
 # IAM Service Account Credentials
 
-floci-gcp emulates the [IAM Service Account Credentials](https://cloud.google.com/iam/docs/reference/credentials/rest) API (`iamcredentials.googleapis.com` v1) with REST JSON, supporting `generateAccessToken` for service-account impersonation flows (for example `ImpersonatedCredentials` in the GCP SDKs).
+floci-gcp emulates the [IAM Service Account Credentials](https://cloud.google.com/iam/docs/reference/credentials/rest) API (`iamcredentials.googleapis.com` v1) with REST JSON, supporting `generateAccessToken`, `signBlob` and `signJwt` for service-account impersonation flows (for example `ImpersonatedCredentials` in the GCP SDKs, which call `signBlob` to make GCS signed URLs).
 
 Since the emulator accepts all requests without credential validation, impersonation is **shape-only**: the endpoint returns a wire-compatible response, but the vended token is an opaque stub (`floci-gcp-impersonated-<uuid>`) that no other emulated service validates.
 
@@ -26,6 +26,20 @@ Request body:
 
 Response: `{ "accessToken": "...", "expireTime": "..." }`.
 
+```
+POST /v1/projects/-/serviceAccounts/{serviceAccount}:signBlob
+POST /v1/projects/-/serviceAccounts/{serviceAccount}:signJwt
+```
+
+Both sign with the service account's Google-managed RSA-2048 key (see [Sign Blob](iam.md#sign-blob-v4-signed-urls)); the account must exist, or the call fails with `PERMISSION_DENIED`.
+
+| Method | Request | Response |
+|---|---|---|
+| `signBlob` | `payload`: base64 bytes | `{ "keyId", "signedBlob" }`, an RSASSA-PKCS1-v1_5 SHA-256 signature |
+| `signJwt` | `payload`: a JSON object of JWT claims; an `exp` claim must be an integer timestamp, not in the past and at most 12 hours ahead | `{ "keyId", "signedJwt" }`, an RS256 JWT whose header carries `kid` |
+
+IAM v1 `serviceAccounts.signBlob` uses the same path when the project is `-`; a request that sends `bytesToSign` instead of `payload` is answered in the IAM v1 shape. Because that path is served here, it returns `UNAVAILABLE` while the IAM Credentials service is disabled.
+
 ## Quick Start
 
 ```java
@@ -40,6 +54,6 @@ ImpersonatedCredentials credentials = ImpersonatedCredentials.newBuilder()
 
 ## Not Yet Supported
 
-- `generateIdToken`, `signBlob`, `signJwt` on this surface (IAM's own `signBlob` lives in the [IAM service](iam.md))
+- `generateIdToken`
 - Scope-based authorization of the vended token (tokens are never validated)
 - Delegation chains (`delegates` is ignored)

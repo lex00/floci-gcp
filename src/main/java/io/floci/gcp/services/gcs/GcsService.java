@@ -21,9 +21,9 @@ import io.floci.gcp.services.gcs.model.GcsContentRange;
 import io.floci.gcp.services.gcs.model.GcsMultipartUpload;
 import io.floci.gcp.services.gcs.model.GcsObjectDownload;
 import io.floci.gcp.services.gcs.model.GcsObjectMeta;
+import io.floci.gcp.services.gcs.model.GcsObjectPreconditions;
 import io.floci.gcp.services.gcs.model.GcsRewriteResult;
 import io.floci.gcp.services.gcs.model.GcsRewriteSession;
-import io.floci.gcp.services.gcs.model.GcsObjectPreconditions;
 import io.floci.gcp.services.gcs.model.GcsStreamingUpload;
 import io.floci.gcp.services.gcs.model.ResumableChunkOutcome;
 import io.floci.gcp.services.gcs.model.ResumableUpload;
@@ -35,12 +35,9 @@ import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
-import io.grpc.BindableService;
-import io.grpc.ServerInterceptors;
 import org.jboss.logging.Logger;
 
 import java.net.URLEncoder;
-import java.util.Optional;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -51,11 +48,13 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Comparator;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -210,12 +209,12 @@ public class GcsService {
                         GcsBatchController.class, GcsGrpcController.class,
                         GcsProjectController.class,
                         GcsHmacKeyController.class)
+                .api("storage.googleapis.com", "Cloud Storage API")
+                .usageAdapter(new GcsServiceUsageAdapter(this))
                 .build());
         if (config.services().gcs().enabled()) {
-            GcsGrpcController controller = new GcsGrpcController(this, config, authorizationService);
-            BindableService intercepted = () -> ServerInterceptors.intercept(
-                    controller, grpcAuthorizationInterceptor);
-            grpcServerManager.bind(intercepted);
+            grpcServerManager.bind(new GcsGrpcController(this, config, authorizationService),
+                    grpcAuthorizationInterceptor);
         }
     }
 
@@ -623,9 +622,12 @@ public class GcsService {
 
     public List<GcsBucket> listBuckets(String projectId) {
         LOG.debugf("listBuckets project=%s", projectId);
+        if (projectId == null || projectId.isBlank()) {
+            throw GcpException.invalidArgument("Required parameter: project").withReason("required");
+        }
         List<GcsBucket> buckets = bucketStore.scan(k -> true).stream()
                 .map(this::withProjectDefaults)
-                .filter(b -> projectId == null || matchesProject(b, projectId))
+                .filter(b -> matchesProject(b, projectId))
                 .toList();
         LOG.debugf("listBuckets project=%s count=%d", projectId, buckets.size());
         return buckets;
@@ -894,7 +896,7 @@ public class GcsService {
                 return new GcsObjectDownload(getObjectMeta(bucket, objectName, generation),
                         getObjectData(bucket, objectName, generation, customerEncryption));
             }
-            var meta = getObjectMeta(bucket, objectName);
+            GcsObjectMeta meta = getObjectMeta(bucket, objectName);
             return new GcsObjectDownload(meta,
                     getObjectData(bucket, objectName, meta.getGeneration(), customerEncryption));
         }
@@ -938,19 +940,11 @@ public class GcsService {
             String archiveKey = key + "\0" + live.getGeneration();
             GcsObjectMeta archived = cloneMeta(live);
             archived.setIsLatest(false);
+            if (archived.getTimeDeleted() == null) {
+                archived.setTimeDeleted(nowTimestamp());
+            }
             objectDataStore.get(key).ifPresent(oldData -> objectDataStore.put(archiveKey, oldData));
             objectMetaStore.put(archiveKey, archived);
-            long markerGen = nextGeneration();
-            GcsObjectMeta marker = new GcsObjectMeta();
-            marker.setName(objectName);
-            marker.setBucket(bucket);
-            marker.setGeneration(String.valueOf(markerGen));
-            marker.setIsLatest(true);
-            String now = nowTimestamp();
-            marker.setTimeDeleted(now);
-            marker.setTimeCreated(now);
-            marker.setUpdated(now);
-            objectMetaStore.put(key + "\0" + markerGen, marker);
         }
         GcsObjectMeta deletedMeta = live;
         softDelete(bucket, objectName, live);
@@ -993,7 +987,7 @@ public class GcsService {
         boolean progressed;
         do {
             progressed = false;
-            for (var iterator = pending.iterator(); iterator.hasNext();) {
+            for (Iterator<String> iterator = pending.iterator(); iterator.hasNext();) {
                 String legacyKey = iterator.next();
                 GcsObjectMeta meta = objectMetaStore.get(legacyKey).orElse(null);
                 String targetKey = legacyMigrationTarget(legacyKey, meta);
@@ -1380,9 +1374,9 @@ public class GcsService {
         }
         byte[] composed = new byte[0];
         GcsObjectMeta firstSourceMeta = null;
-        var componentCount = 0;
+        int componentCount = 0;
         for (GcsComposeSource src : sources) {
-            var source = getObjectForDownload(bucket, src.name(), src.generation(), GcsCustomerEncryption.none());
+            GcsObjectDownload source = getObjectForDownload(bucket, src.name(), src.generation(), GcsCustomerEncryption.none());
             if (src.ifGenerationMatch() != null
                     && Long.parseLong(source.meta().getGeneration()) != src.ifGenerationMatch()) {
                 throw GcpException.conditionNotMet("Source generation condition not met: " + src.name());
@@ -1390,10 +1384,10 @@ public class GcsService {
             if (firstSourceMeta == null) {
                 firstSourceMeta = source.meta();
             }
-            var sourceComponents = source.meta().getComponentCount();
+            Integer sourceComponents = source.meta().getComponentCount();
             componentCount += sourceComponents != null ? sourceComponents : 1;
-            var data = source.data();
-            var merged = new byte[composed.length + data.length];
+            byte[] data = source.data();
+            byte[] merged = new byte[composed.length + data.length];
             System.arraycopy(composed, 0, merged, 0, composed.length);
             System.arraycopy(data, 0, merged, composed.length, data.length);
             composed = merged;
@@ -1595,7 +1589,7 @@ public class GcsService {
         LOG.debugf("copyObject src=%s/%s dst=%s/%s", srcBucket, srcObject, dstBucket, dstObject);
         // Read the source before taking the destination locks. Nesting two
         // stripe locks could deadlock with a copy running in the other direction.
-        var src = getObjectForDownload(srcBucket, srcObject, srcGeneration, GcsCustomerEncryption.none());
+        GcsObjectDownload src = getObjectForDownload(srcBucket, srcObject, srcGeneration, GcsCustomerEncryption.none());
         synchronized (bucketLock(dstBucket)) {
             synchronized (objectLock(dstBucket, dstObject)) {
                 requireOverwritePermission(dstBucket, dstObject, requireOverwritePermission);
@@ -1639,8 +1633,8 @@ public class GcsService {
 
     private GcsObjectMeta copyObjectLocked(GcsObjectDownload src, String dstBucket, String dstObject,
             GcsObjectMeta destinationTemplate, String baseUrl) {
-        var srcMeta = src.meta();
-        var dstMeta = putObjectLocked(dstBucket, dstObject, srcMeta.getContentType(), src.data(),
+        GcsObjectMeta srcMeta = src.meta();
+        GcsObjectMeta dstMeta = putObjectLocked(dstBucket, dstObject, srcMeta.getContentType(), src.data(),
                 GcsCustomerEncryption.none(), null, destinationTemplate, baseUrl, ObjectWriteMode.ORDINARY, null);
         if (srcMeta.getMetadata() != null) {
             dstMeta.setMetadata(new LinkedHashMap<>(srcMeta.getMetadata()));
@@ -1673,7 +1667,7 @@ public class GcsService {
             // Lock stripes in a stable order so opposite-direction moves cannot deadlock.
             synchronized (objectLocks[Math.min(sourceLockIndex, destinationLockIndex)]) {
                 synchronized (objectLocks[Math.max(sourceLockIndex, destinationLockIndex)]) {
-                    var source = getObjectForDownload(bucket, srcObject, null, GcsCustomerEncryption.none());
+                    GcsObjectDownload source = getObjectForDownload(bucket, srcObject, null, GcsCustomerEncryption.none());
                     checkPreconditions(Optional.of(source.meta()), sourcePreconditions);
                     checkObjectMutable(source.meta());
                     requireOverwritePermission(bucket, dstObject, requireOverwritePermission);

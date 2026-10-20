@@ -15,6 +15,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Timestamp;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
+import io.floci.gcp.core.common.GcpResourceNames;
 import io.floci.gcp.lifecycle.GrpcServerManager;
 import io.floci.gcp.services.bigquery.model.Dataset;
 import io.floci.gcp.services.bigquery.model.Table;
@@ -90,7 +91,9 @@ public class BigQueryStorageRead {
 
     void onStart(@Observes StartupEvent event) {
         if (config.services().bigquery().enabled()) {
-            grpcServerManager.bind(new BigQueryReadController(this, vertx));
+            grpcServerManager.bindForApi(new BigQueryReadController(this, vertx),
+                    "bigquerystorage.googleapis.com", "BigQuery Storage API",
+                    new BigQueryStorageServiceUsageAdapter());
         }
     }
 
@@ -294,7 +297,7 @@ public class BigQueryStorageRead {
     }
 
     private static String sessionProject(String sessionName) {
-        return sessionName.substring("projects/".length(), sessionName.indexOf('/', "projects/".length()));
+        return GcpResourceNames.parseProject(sessionName);
     }
 
     /** Selected top-level fields in table order; nested selections are not emulated. */

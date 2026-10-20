@@ -4,6 +4,7 @@ import io.floci.gcp.core.common.GcpException;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
+import javax.crypto.Mac;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.OAEPParameterSpec;
@@ -12,6 +13,7 @@ import javax.crypto.spec.SecretKeySpec;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.Signature;
@@ -19,10 +21,12 @@ import java.security.spec.ECGenParameterSpec;
 import java.security.spec.MGF1ParameterSpec;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.util.Base64;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Real local crypto backing Cloud KMS operations. Symmetric keys use AES-256-GCM; asymmetric
- * keys use standard JCA RSA/EC primitives. Key material is generated at version-create time and
+ * keys use standard JCA RSA/EC primitives; MAC keys are random HMAC keys the size of the hash output. Key material is generated at version-create time and
  * stored Base64-encoded (PKCS8 private, X.509 public) on the {@code StoredCryptoKeyVersion}.
  *
  * <p>The symmetric envelope is {@code versionNumber(4 bytes BE) || IV(12 bytes) || ciphertext+tag}.
@@ -40,6 +44,18 @@ final class KmsCrypto {
             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, (byte) 0x86, 0x48, 0x01,
             0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20
     };
+
+    /** JCA name and key length in bytes per HMAC algorithm; Cloud KMS sizes the key to the hash output. */
+    private record HmacSpec(String jcaName, int keyBytes) {}
+
+    private static final Map<String, HmacSpec> HMAC_SPECS = Map.of(
+            "HMAC_SHA256", new HmacSpec("HmacSHA256", 32),
+            "HMAC_SHA1", new HmacSpec("HmacSHA1", 20),
+            "HMAC_SHA384", new HmacSpec("HmacSHA384", 48),
+            "HMAC_SHA512", new HmacSpec("HmacSHA512", 64),
+            "HMAC_SHA224", new HmacSpec("HmacSHA224", 28));
+
+    static final Set<String> HMAC_ALGORITHMS = HMAC_SPECS.keySet();
 
     private KmsCrypto() {}
 
@@ -64,7 +80,13 @@ final class KmsCrypto {
                     gen.initialize(new ECGenParameterSpec("secp256r1"));
                     yield encodePair(gen.generateKeyPair());
                 }
-                default -> throw GcpException.invalidArgument("Unsupported algorithm: " + algorithm);
+                default -> {
+                    HmacSpec hmac = HMAC_SPECS.get(algorithm);
+                    if (hmac == null) {
+                        throw GcpException.invalidArgument("Unsupported algorithm: " + algorithm);
+                    }
+                    yield new GeneratedKey(Base64.getEncoder().encodeToString(randomBytes(hmac.keyBytes())), null);
+                }
             };
         } catch (GcpException e) {
             throw e;
@@ -183,6 +205,27 @@ final class KmsCrypto {
         } catch (Exception e) {
             throw GcpException.invalidArgument("Asymmetric decryption failed: the ciphertext is invalid");
         }
+    }
+
+    // ── MAC (HMAC) ───────────────────────────────────────────────────────────
+
+    static byte[] macSign(String algorithm, String keyMaterialBase64, byte[] data) {
+        HmacSpec hmac = HMAC_SPECS.get(algorithm);
+        if (hmac == null) {
+            throw GcpException.invalidArgument("Algorithm does not support MAC signing: " + algorithm);
+        }
+        try {
+            Mac mac = Mac.getInstance(hmac.jcaName());
+            mac.init(new SecretKeySpec(Base64.getDecoder().decode(keyMaterialBase64), hmac.jcaName()));
+            return mac.doFinal(data);
+        } catch (Exception e) {
+            throw GcpException.internal("MAC signing failed: " + e.getMessage());
+        }
+    }
+
+    /** Compares in constant time, so a wrong tag of any length is a plain mismatch, not an error. */
+    static boolean macVerify(String algorithm, String keyMaterialBase64, byte[] data, byte[] tag) {
+        return MessageDigest.isEqual(macSign(algorithm, keyMaterialBase64, data), tag);
     }
 
     static String toPem(String publicKeyBase64) {

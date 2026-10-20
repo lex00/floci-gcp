@@ -144,7 +144,7 @@ floci-gcp does not load `datastore.indexes.yaml` or enforce Datastore index requ
 
 ## GQL Queries
 
-Datastore supports GQL (Google Query Language) over HTTP/protobuf. The gRPC `RunQuery` handler currently supports structured queries only.
+Datastore supports GQL (Google Query Language) in `RunQuery` over both gRPC and HTTP/protobuf. GQL aggregation queries (`AGGREGATE ... OVER (...)`) are not supported and return `UNIMPLEMENTED`.
 
 ```java
 Query<Entity> query = Query.newGqlQueryBuilder(Query.ResultType.ENTITY,
@@ -163,11 +163,24 @@ Supported GQL syntax:
 - `LIMIT n` / `OFFSET n`
 - Named bindings (`@name`) and positional bindings (`@1`)
 
+## Deviations from real Datastore
+
+- With persistence enabled, a key property written by floci-gcp 0.11.0 or earlier
+  was stored only as a flattened path, which cannot be rebuilt into a key. It reads
+  back as `NULL` until the entity is written again, although equality filters still
+  match it. An embedded entity written then reads back without its own key, since
+  that key was not stored.
+- `RunAggregationQuery` does not reject duplicate aliases, zero aggregations, or
+  more than five.
+- `Value.exclude_from_indexes` is stored and read back, but it does not change
+  queries: a filter or sort on an excluded property still matches the entity,
+  where real Datastore leaves it out of the result.
+
 ## Supported Operations
 
 - `Lookup` (gRPC and HTTP/protobuf)
-- `RunQuery` (structured queries over both transports; GQL over HTTP/protobuf)
-- `RunAggregationQuery` (COUNT over HTTP/protobuf)
+- `RunQuery` (structured and GQL queries over both transports)
+- `RunAggregationQuery` (COUNT with `up_to`, SUM and AVG over both transports)
 - `BeginTransaction` (gRPC and HTTP/protobuf; limited semantics described above)
 - `Commit` (gRPC and HTTP/protobuf; limited semantics described above)
 - `Rollback` (gRPC and HTTP/protobuf; no-op)

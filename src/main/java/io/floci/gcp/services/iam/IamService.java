@@ -7,6 +7,7 @@ import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.ServiceDescriptor;
 import io.floci.gcp.core.common.ServiceProtocol;
 import io.floci.gcp.core.common.ServiceRegistry;
+import io.floci.gcp.core.storage.InMemoryStorage;
 import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
 import io.floci.gcp.lifecycle.GrpcServerManager;
@@ -14,6 +15,9 @@ import io.floci.gcp.services.iam.authorization.IamAuthorizationService;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.iam.model.StoredServiceAccount;
 import io.floci.gcp.services.iam.model.StoredServiceAccountKey;
+import io.floci.gcp.services.iam.model.StoredSigningKey;
+import io.floci.gcp.services.secretmanager.SecretManagerIamAuthorizationAdapter;
+import io.floci.gcp.services.secretmanager.SecretManagerService;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
@@ -22,13 +26,18 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
+import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
-import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,37 +62,57 @@ public class IamService {
     private final StorageBackend<String, StoredServiceAccount> saStore;
     private final StorageBackend<String, StoredServiceAccountKey> keyStore;
     private final StorageBackend<String, StoredPolicy> policyStore;
+    private final StorageBackend<String, StoredSigningKey> signingKeyStore;
+    private final Object signingKeyLock = new Object();
     private final ServiceRegistry serviceRegistry;
     private final EmulatorConfig config;
     private final GrpcServerManager grpcServerManager;
     private final Instance<IamAuthorizationService> authorization;
+    private final Instance<SecretManagerService> secretManager;
+    private final SecretManagerIamAuthorizationAdapter secretManagerIamAdapter;
     private final Map<String, Consumer<String>> policyResolvers = new ConcurrentHashMap<>();
 
     @Inject
     public IamService(ServiceRegistry serviceRegistry, EmulatorConfig config, StorageFactory storageFactory,
-            GrpcServerManager grpcServerManager, Instance<IamAuthorizationService> authorization) {
+            GrpcServerManager grpcServerManager, Instance<IamAuthorizationService> authorization,
+            Instance<SecretManagerService> secretManager,
+            SecretManagerIamAuthorizationAdapter secretManagerIamAdapter) {
         this.serviceRegistry = serviceRegistry;
         this.config = config;
         this.grpcServerManager = grpcServerManager;
         this.authorization = authorization;
+        this.secretManager = secretManager;
+        this.secretManagerIamAdapter = secretManagerIamAdapter;
         this.saStore = storageFactory.createGlobal("iam-service-accounts", "iam-service-accounts.json",
                 new TypeReference<Map<String, StoredServiceAccount>>() {});
         this.keyStore = storageFactory.createGlobal("iam-sa-keys", "iam-sa-keys.json",
                 new TypeReference<Map<String, StoredServiceAccountKey>>() {});
         this.policyStore = storageFactory.createGlobal("iam-policies", "iam-policies.json",
                 new TypeReference<Map<String, StoredPolicy>>() {});
+        this.signingKeyStore = storageFactory.createGlobal("iam-signing-keys", "iam-signing-keys.json",
+                new TypeReference<Map<String, StoredSigningKey>>() {});
     }
 
     IamService(StorageBackend<String, StoredServiceAccount> saStore,
             StorageBackend<String, StoredServiceAccountKey> keyStore,
             StorageBackend<String, StoredPolicy> policyStore) {
+        this(saStore, keyStore, policyStore, new InMemoryStorage<>());
+    }
+
+    IamService(StorageBackend<String, StoredServiceAccount> saStore,
+            StorageBackend<String, StoredServiceAccountKey> keyStore,
+            StorageBackend<String, StoredPolicy> policyStore,
+            StorageBackend<String, StoredSigningKey> signingKeyStore) {
         this.saStore = saStore;
         this.keyStore = keyStore;
         this.policyStore = policyStore;
+        this.signingKeyStore = signingKeyStore;
         this.serviceRegistry = null;
         this.config = null;
         this.grpcServerManager = null;
         this.authorization = null;
+        this.secretManager = null;
+        this.secretManagerIamAdapter = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -92,10 +121,12 @@ public class IamService {
                 .storageKey("iam")
                 .protocol(ServiceProtocol.REST)
                 .resourceClasses(IamController.class)
+                .api("iam.googleapis.com", "Identity and Access Management (IAM) API")
+                .usageAdapter(new IamServiceUsageAdapter(this))
                 .build());
         // Serves the google.iam.v1.IAMPolicy mixin for all services; not gated on
         // the iam REST toggle so Pub/Sub IAM keeps working when iam is disabled.
-        grpcServerManager.bind(new IamPolicyGrpcController(this));
+        grpcServerManager.bind(new IamPolicyGrpcController(this, secretManager, secretManagerIamAdapter));
     }
 
     // ── Service Accounts ───────────────────────────────────────────────────────
@@ -185,8 +216,12 @@ public class IamService {
     public void deleteServiceAccount(String project, String emailOrId) {
         ServiceAccountRef ref = resolve(project, emailOrId);
         String key = saKey(ref.project(), ref.email());
-        saStore.get(key).orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
-        saStore.delete(key);
+        // Under the signing-key lock, so a first signing call cannot write the key back after it is removed.
+        synchronized (signingKeyLock) {
+            saStore.get(key).orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
+            saStore.delete(key);
+            signingKeyStore.delete(signingKeyStorageKey(ref.project(), ref.email()));
+        }
         LOG.debugf("deleteServiceAccount project=%s email=%s", ref.project(), ref.email());
     }
 
@@ -515,21 +550,84 @@ public class IamService {
         LOG.debugf("deleteKey project=%s email=%s keyId=%s", ref.project(), ref.email(), keyId);
     }
 
+    /** IAM v1 {@code serviceAccounts.signBlob}: the response names the signature {@code signature}. */
     public Map<String, String> signBlob(String project, String emailOrId, String bytesToSignBase64) {
-        ServiceAccountRef ref = resolve(project, emailOrId);
-        saStore.get(saKey(ref.project(), ref.email()))
-                .orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
-        byte[] inputBytes = Base64.getDecoder().decode(bytesToSignBase64);
-        byte[] signature;
+        SignedBytes signed = sign(project, emailOrId, decodeBase64(bytesToSignBase64, "bytesToSign"));
+        return Map.of("keyId", signed.keyId(), "signature", Base64.getEncoder().encodeToString(signed.signature()));
+    }
+
+    public record SignedBytes(String keyId, byte[] signature) {}
+
+    /**
+     * Signs {@code data} with RSASSA-PKCS1-v1_5 SHA-256 using the service account's Google-managed
+     * key, which is created on first use and kept until the account is deleted.
+     */
+    public SignedBytes sign(String project, String emailOrId, byte[] data) {
+        return sign(project, emailOrId, keyId -> data);
+    }
+
+    /**
+     * Like {@link #sign(String, String, byte[])}, for input that names the signing key (a JWT header's
+     * {@code kid}): {@code input} gets the id of the key that then signs what it returns.
+     */
+    public SignedBytes sign(String project, String emailOrId, Function<String, byte[]> input) {
+        StoredSigningKey key = signingKey(resolve(project, emailOrId));
+        byte[] data = input.apply(key.getKeyId());
         try {
-            MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-            signature = sha256.digest(inputBytes);
-        } catch (NoSuchAlgorithmException e) {
-            throw GcpException.internal("SHA-256 not available");
+            PrivateKey privateKey = KeyFactory.getInstance("RSA")
+                    .generatePrivate(new PKCS8EncodedKeySpec(Base64.getDecoder().decode(key.getPrivateKey())));
+            Signature signer = Signature.getInstance("SHA256withRSA");
+            signer.initSign(privateKey);
+            signer.update(data);
+            return new SignedBytes(key.getKeyId(), signer.sign());
+        } catch (GeneralSecurityException e) {
+            throw GcpException.internal("Signing failed: " + e.getMessage());
         }
-        List<StoredServiceAccountKey> keys = listKeys(ref.project(), ref.email());
-        String keyId = keys.isEmpty() ? "stub-key-id" : keys.get(0).getKeyId();
-        return Map.of("keyId", keyId, "signedBlob", Base64.getEncoder().encodeToString(signature));
+    }
+
+    /** The id of the key {@link #sign} uses, creating the key if the account has not signed yet. */
+    public String signingKeyId(String project, String emailOrId) {
+        return signingKey(resolve(project, emailOrId)).getKeyId();
+    }
+
+    /** The account's signing key, created if missing; the account is checked under the lock deletion takes. */
+    private StoredSigningKey signingKey(ServiceAccountRef ref) {
+        String storageKey = signingKeyStorageKey(ref.project(), ref.email());
+        synchronized (signingKeyLock) {
+            saStore.get(saKey(ref.project(), ref.email()))
+                    .orElseThrow(() -> GcpException.notFound("Service account not found: " + ref.email()));
+            Optional<StoredSigningKey> existing = signingKeyStore.get(storageKey);
+            if (existing.isPresent()) {
+                return existing.get();
+            }
+            KeyPairGenerator generator;
+            try {
+                generator = KeyPairGenerator.getInstance("RSA");
+            } catch (NoSuchAlgorithmException e) {
+                throw GcpException.internal("Key generation failed: " + e.getMessage());
+            }
+            generator.initialize(2048);
+            KeyPair keyPair = generator.generateKeyPair();
+            byte[] keyIdBytes = new byte[20];
+            ThreadLocalRandom.current().nextBytes(keyIdBytes);
+            StoredSigningKey created = new StoredSigningKey(HexFormat.of().formatHex(keyIdBytes),
+                    Base64.getEncoder().encodeToString(keyPair.getPrivate().getEncoded()));
+            signingKeyStore.put(storageKey, created);
+            LOG.debugf("created signing key project=%s email=%s keyId=%s", ref.project(), ref.email(), created.getKeyId());
+            return created;
+        }
+    }
+
+    private static byte[] decodeBase64(String value, String field) {
+        try {
+            return Base64.getDecoder().decode(value);
+        } catch (IllegalArgumentException e) {
+            throw GcpException.invalidArgument(field + " must be base64-encoded");
+        }
+    }
+
+    private static String signingKeyStorageKey(String project, String email) {
+        return "signing-key:" + project + ":" + email;
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
@@ -566,6 +664,16 @@ public class IamService {
                 .orElseThrow(() -> GcpException.permissionDenied(
                         "Permission denied on resource (or it may not exist): projects/-/serviceAccounts/"
                                 + emailOrId));
+    }
+
+    /** The project that owns an account addressed with the {@code -} project wildcard. */
+    Optional<String> owningProject(String emailOrId) {
+        try {
+            return Optional.of(resolve(WILDCARD_PROJECT, emailOrId).project());
+        } catch (GcpException expected) {
+            // An account that does not exist has no owner.
+            return Optional.empty();
+        }
     }
 
     // GCP account IDs must start with a letter, so an all-digit identifier is tried as a unique ID

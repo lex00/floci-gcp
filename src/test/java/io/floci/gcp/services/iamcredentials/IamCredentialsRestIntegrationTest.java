@@ -9,8 +9,11 @@ import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -141,5 +144,75 @@ class IamCredentialsRestIntegrationTest {
                 .then()
                 .statusCode(400)
                 .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void signBlobWithAPayloadReturnsASignedBlob() {
+        String sa = createServiceAccount("rest-signer");
+
+        given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("delegates", List.of(), "payload", "aGVsbG8="))
+                .when().post("/v1/projects/-/serviceAccounts/" + sa + ":signBlob")
+                .then()
+                .statusCode(200)
+                .body("keyId", matchesPattern("[0-9a-f]{40}"))
+                .body("signedBlob", notNullValue())
+                .body("signature", nullValue());
+    }
+
+    @Test
+    void iamV1SignBlobKeepsItsShapeOnTheWildcardAndOnAProject() {
+        String sa = createServiceAccount("v1-signer");
+
+        String wildcardKeyId = given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("bytesToSign", "aGVsbG8="))
+                .when().post("/v1/projects/-/serviceAccounts/" + sa + ":signBlob")
+                .then()
+                .statusCode(200)
+                .body("signature", notNullValue())
+                .body("signedBlob", nullValue())
+                .extract().path("keyId");
+
+        given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("bytesToSign", "aGVsbG8="))
+                .when().post("/v1/projects/sign-project/serviceAccounts/" + sa + ":signBlob")
+                .then()
+                .statusCode(200)
+                .body("keyId", equalTo(wildcardKeyId))
+                .body("signature", notNullValue());
+    }
+
+    @Test
+    void signJwtReturnsASignedJwt() {
+        String sa = createServiceAccount("jwt-signer");
+
+        String jwt = given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("payload", "{\"sub\":\"user\"}"))
+                .when().post("/v1/projects/-/serviceAccounts/" + sa + ":signJwt")
+                .then()
+                .statusCode(200)
+                .body("keyId", matchesPattern("[0-9a-f]{40}"))
+                .extract().path("signedJwt");
+
+        assertEquals(3, jwt.split("\\.").length);
+    }
+
+    @Test
+    void signingForAMissingAccountIsDenied() {
+        given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("payload", "aGVsbG8="))
+                .when().post("/v1/projects/-/serviceAccounts/ghost@sign-project.iam.gserviceaccount.com:signBlob")
+                .then()
+                .statusCode(403)
+                .body("error.status", equalTo("PERMISSION_DENIED"));
+    }
+
+    private static String createServiceAccount(String accountId) {
+        return given().urlEncodingEnabled(false).contentType("application/json")
+                .body(Map.of("accountId", accountId))
+                .when().post("/v1/projects/sign-project/serviceAccounts")
+                .then()
+                .statusCode(200)
+                .extract().path("email");
     }
 }

@@ -28,6 +28,20 @@ class IamCredentialsDisabledRestIntegrationTest {
                 .body("error.message", equalTo("Service iamcredentials is not enabled."));
     }
 
+    @Test
+    void disabledIamCredentialsAlsoCoversSignBlobAndSignJwt() {
+        for (String method : List.of("signBlob", "signJwt")) {
+            given()
+                    .urlEncodingEnabled(false)
+                    .contentType("application/json")
+                    .body(Map.of("payload", "e30="))
+                    .when().post("/v1/projects/-/serviceAccounts/test@test-project.iam.gserviceaccount.com:" + method)
+                    .then()
+                    .statusCode(503)
+                    .body("error.status", equalTo("UNAVAILABLE"));
+        }
+    }
+
     public static class DisabledIamCredentialsProfile implements QuarkusTestProfile {
         @Override
         public Map<String, String> getConfigOverrides() {

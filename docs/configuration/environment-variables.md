@@ -14,6 +14,7 @@ Variable names follow the config path, uppercased with dots and dashes replaced 
 | `FLOCI_GCP_BASE_URL` | `http://localhost:4588` | Base URL embedded in service responses (GCS object URLs, pre-signed URLs, etc.) |
 | `FLOCI_GCP_HOSTNAME` | _(none)_ | Overrides only the hostname part of `FLOCI_GCP_BASE_URL`. Set to the Compose/container service name so other containers can reach floci-gcp by DNS |
 | `FLOCI_GCP_DEFAULT_PROJECT_ID` | `floci-local` | Default GCP project ID used when no project is specified in the request |
+| `FLOCI_GCP_PROJECTS_STRICT` | `false` | Only the default project and projects created via Resource Manager exist; REST requests for other projects return 403 `PERMISSION_DENIED` ([details](../services/resource-manager.md#strict-mode)) |
 | `FLOCI_GCP_MAX_REQUEST_SIZE` | `512` | Maximum request body size, in **megabytes** (applies to uploads, e.g. GCS objects) |
 
 ---
@@ -93,7 +94,7 @@ Each service can be toggled independently. All are enabled by default.
 | `FLOCI_GCP_SERVICES_IAM_ENABLED` | `true` | IAM |
 | `FLOCI_GCP_SERVICES_IAM_AUTHORIZATION_MODE` | `disabled` | `enforce` evaluates stored policies for supported Resource Manager and GCS bucket/object operations. Default `disabled` keeps permissive behavior. [Coverage and limits](../services/iam.md#opt-in-enforcement) |
 | `FLOCI_GCP_SERVICES_IAM_BOOTSTRAP_ADMIN_MEMBER` | unset | Optional IAM member granted `roles/storage.admin` on each newly created bucket |
-| `FLOCI_GCP_SERVICES_IAMCREDENTIALS_ENABLED` | `true` | IAM Service Account Credentials (`generateAccessToken`) |
+| `FLOCI_GCP_SERVICES_IAMCREDENTIALS_ENABLED` | `true` | IAM Service Account Credentials (`generateAccessToken`, `signBlob`, `signJwt`) |
 | `FLOCI_GCP_SERVICES_STS_ENABLED` | `true` | Security Token Service (STS) |
 | `FLOCI_GCP_SERVICES_LOGGING_ENABLED` | `true` | Cloud Logging |
 | `FLOCI_GCP_SERVICES_KMS_ENABLED` | `true` | Cloud KMS |
@@ -114,12 +115,16 @@ Each service can be toggled independently. All are enabled by default.
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_CLEANUP_TIMEOUT` | `15s` | Maximum time to wait for best-effort Docker cleanup after an operation is already resolved |
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_URL_HOST_SUFFIX` | `localhost.floci.io` or `FLOCI_GCP_HOSTNAME` | Host suffix used for generated Cloud Run execution URLs |
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_MAX_WORKER_INSTANCES` | `1` | Maximum replica containers run per Cloud Run worker pool; larger `manualInstanceCount` values are clamped with a warning |
+| `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_SECURITY_OPTS` | unset | Comma-separated Docker security options for Cloud Run workload containers, for example `seccomp=unconfined` |
 | `FLOCI_GCP_SERVICES_CLOUDFUNCTIONS_ENABLED` | `true` | Cloud Functions |
 | `FLOCI_GCP_SERVICES_GKE_ENABLED` | `true` | GKE (Kubernetes Engine) |
 | `FLOCI_GCP_SERVICES_BIGQUERY_ENABLED` | `true` | BigQuery |
 | `FLOCI_GCP_SERVICES_BIGQUERY_MOCK` | `false` | Mock mode, runs queries on a built-in SQL subset instead of the DuckDB sidecar |
 | `FLOCI_GCP_SERVICES_SERVICEUSAGE_ENABLED` | `true` | Service Usage |
-| `FLOCI_GCP_SERVICES_RESOURCEMANAGER_ENABLED` | `true` | Cloud Resource Manager (minimal `projects.get`) |
+| `FLOCI_GCP_SERVICES_SERVICEUSAGE_ENFORCEMENT_ENABLED` | `false` | Reject calls to APIs not enabled in the project with 403 `SERVICE_DISABLED` (see [Service Usage](../services/service-usage.md#enforcing-api-enablement)) |
+| `FLOCI_GCP_SERVICES_SERVICEUSAGE_DEFAULT_ENABLED` | GCP default set | Comma-separated APIs treated as enabled in every project until disabled; only used with enforcement |
+| `FLOCI_GCP_SERVICES_RESOURCEMANAGER_ENABLED` | `true` | Cloud Resource Manager v1 projects API |
+| `FLOCI_GCP_SERVICES_CLOUDBILLING_ENABLED` | `true` | Cloud Billing stub (project billing info) |
 | `FLOCI_GCP_SERVICES_FIREBASEAUTH_ENABLED` | `true` | Firebase Auth (Identity Platform) |
 | `FLOCI_GCP_SERVICES_EVENTARC_ENABLED` | `true` | Eventarc |
 

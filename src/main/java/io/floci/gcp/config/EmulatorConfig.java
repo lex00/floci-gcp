@@ -40,6 +40,8 @@ public interface EmulatorConfig {
 
     StorageConfig storage();
 
+    ProjectsConfig projects();
+
     ServicesConfig services();
 
     DockerConfig docker();
@@ -205,6 +207,8 @@ public interface EmulatorConfig {
 
         ResourceManagerServiceConfig resourcemanager();
 
+        CloudBillingServiceConfig cloudbilling();
+
         FirebaseAuthServiceConfig firebaseauth();
 
         BigQueryServiceConfig bigquery();
@@ -213,6 +217,20 @@ public interface EmulatorConfig {
     interface ServiceUsageServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("false")
+        boolean enforcementEnabled();
+
+        @WithDefault("analyticshub.googleapis.com,apptopology.googleapis.com,bigquery.googleapis.com,"
+                + "bigqueryconnection.googleapis.com,bigquerydatapolicy.googleapis.com,"
+                + "bigquerydatatransfer.googleapis.com,bigquerymigration.googleapis.com,"
+                + "bigqueryreservation.googleapis.com,bigquerystorage.googleapis.com,cloudapis.googleapis.com,"
+                + "cloudtrace.googleapis.com,dataform.googleapis.com,dataplex.googleapis.com,"
+                + "datastore.googleapis.com,logging.googleapis.com,monitoring.googleapis.com,"
+                + "servicemanagement.googleapis.com,serviceusage.googleapis.com,sql-component.googleapis.com,"
+                + "storage-api.googleapis.com,storage-component.googleapis.com,storage.googleapis.com,"
+                + "telemetry.googleapis.com")
+        List<String> defaultEnabled();
     }
 
     interface FirebaseAuthServiceConfig {
@@ -261,6 +279,20 @@ public interface EmulatorConfig {
     interface ResourceManagerServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface CloudBillingServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface ProjectsConfig {
+        /**
+         * When true, only the default project and projects created through Resource Manager
+         * exist; REST requests for any other project return 403 PERMISSION_DENIED.
+         */
+        @WithDefault("false")
+        boolean strict();
     }
 
     interface GkeServiceConfig {
@@ -440,6 +472,14 @@ public interface EmulatorConfig {
 
             @WithDefault("1")
             int maxWorkerInstances();
+
+            /**
+             * Docker security options applied to every Cloud Run workload container, for example
+             * {@code seccomp=unconfined} so workloads can create unprivileged user namespaces as on
+             * Cloud Run. Unset keeps Docker's default seccomp profile.
+             * Env: FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_SECURITY_OPTS
+             */
+            Optional<List<String>> securityOpts();
         }
     }
 

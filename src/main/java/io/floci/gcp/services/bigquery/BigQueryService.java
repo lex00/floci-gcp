@@ -114,6 +114,7 @@ public class BigQueryService {
                 .resourceClasses(BigQueryController.class, BigQueryInternalController.class,
                         BigQueryUploadController.class, BigQueryReadController.class,
                         BigQueryWriteController.class)
+                .api("bigquery.googleapis.com", "BigQuery API")
                 .build());
     }
 
@@ -569,6 +570,27 @@ public class BigQueryService {
      * Dry runs return an unpersisted job carrying the result schema.
      */
     public StoredJob query(String projectId, String location, String jobId, QueryOptions options) {
+        return query(projectId, new JobLocation(projectId, location), jobId, options);
+    }
+
+    /**
+     * jobs.insert for a query: an invalid query is not an HTTP error but a DONE job whose status
+     * carries the error, recorded in the location the job had resolved to when it failed.
+     */
+    public StoredJob insertQuery(String projectId, String location, String jobId, QueryOptions options) {
+        JobLocation jobLocation = new JobLocation(projectId, location);
+        try {
+            return query(projectId, jobLocation, jobId, options);
+        } catch (GcpException e) {
+            // A dry run reports an invalid query as an HTTP error, as does a duplicate job ID.
+            if (isDuplicateJobId(e) || options.dryRun()) {
+                throw e;
+            }
+            return failedJob(projectId, jobLocation.resolved(), jobId, options.sql(), e);
+        }
+    }
+
+    private StoredJob query(String projectId, JobLocation jobLocation, String jobId, QueryOptions options) {
         // Reserve the ID before any parsing/lookup so a duplicate explicit jobId always
         // 409s, even when the query would otherwise fail, matching failedJob's path.
         String resolvedJobId = options.dryRun() ? null : reserveJobId(projectId, jobId);
@@ -582,7 +604,7 @@ public class BigQueryService {
         StoredJob job = new StoredJob();
         job.setJobId(resolvedJobId);
         job.setProjectId(projectId);
-        job.setLocation(location != null && !location.isBlank() ? location : "US");
+        job.setLocation(jobLocation.resolved());
         job.setQuery(options.sql());
         job.setState("DONE");
         job.setCreationTime(nowMillis());
@@ -605,7 +627,8 @@ public class BigQueryService {
         }
 
         BigQuerySqlEngine.Result result = engine.execute(request(projectId, options.sql(), options,
-                options.dryRun()), tables(projectId));
+                options.dryRun()), tables(projectId, jobLocation));
+        job.setLocation(jobLocation.resolved());
         job.setStatementType(result.statementType());
         job.setTotalBytesProcessed(String.valueOf(result.totalBytesProcessed()));
         if (options.dryRun()) {
@@ -1009,9 +1032,16 @@ public class BigQueryService {
     }
 
     BigQuerySqlEngine.Tables tables(String projectId) {
+        return tables(projectId, null);
+    }
+
+    private BigQuerySqlEngine.Tables tables(String projectId, JobLocation jobLocation) {
         return new BigQuerySqlEngine.Tables() {
             @Override
             public Table table(String datasetId, String tableId) {
+                if (jobLocation != null) {
+                    datasetStore.get(datasetId).ifPresent(jobLocation::admit);
+                }
                 return getTable(projectId, datasetId, tableId);
             }
 
@@ -1025,6 +1055,13 @@ public class BigQueryService {
 
             @Override
             public List<Map<String, Object>> informationSchema(InformationSchema.Ref ref) {
+                if (jobLocation != null) {
+                    if (ref.dataset() != null) {
+                        datasetStore.get(ref.dataset()).ifPresent(jobLocation::admit);
+                    } else if (ref.region() != null) {
+                        jobLocation.adoptRegion(ref.region());
+                    }
+                }
                 return informationSchemaRows(projectId, ref.view(), ref.dataset(), ref.region());
             }
         };
@@ -1288,6 +1325,52 @@ public class BigQueryService {
                 tables(projectId));
     }
 
+    /**
+     * The location a query job runs in. An explicit {@code jobReference.location} /
+     * {@code QueryRequest.location} is kept; otherwise the job takes the location of the first
+     * dataset the query references ("the query is used for determining the processing location"),
+     * falling back to {@code US}. Every referenced dataset must then live in that location, compared
+     * case-insensitively, or the dataset is reported as not found there.
+     */
+    private static final class JobLocation {
+
+        private final String projectId;
+        private String location;
+
+        JobLocation(String projectId, String requested) {
+            this.projectId = projectId;
+            this.location = requested != null && !requested.isBlank() ? requested : null;
+        }
+
+        void admit(Dataset dataset) {
+            String datasetLocation = dataset.getLocation() != null ? dataset.getLocation() : "US";
+            if (location == null) {
+                location = datasetLocation;
+                return;
+            }
+            if (!location.equalsIgnoreCase(datasetLocation)) {
+                throw GcpException.notFound("Not found: Dataset " + projectId + ":"
+                        + dataset.getDatasetReference().getDatasetId() + " was not found in location " + location)
+                        .withReason("notFound");
+            }
+        }
+
+        /**
+         * A region-qualified INFORMATION_SCHEMA view ({@code region-eu}) runs in that region when no
+         * location is known yet. A conflicting region is not rejected: the references do not say
+         * which error BigQuery returns for it.
+         */
+        void adoptRegion(String region) {
+            if (location == null) {
+                location = region.indexOf('-') < 0 ? region.toUpperCase(Locale.ROOT) : region;
+            }
+        }
+
+        String resolved() {
+            return location != null ? location : "US";
+        }
+    }
+
     /** Persists a failed query job (used by {@code jobs.insert}, which must not throw for SQL errors). */
     public StoredJob failedJob(String projectId, String location, String jobId,
             String sql, GcpException cause) {
@@ -1341,8 +1424,19 @@ public class BigQueryService {
     }
 
     public StoredJob getJob(String projectId, String jobId) {
+        return getJob(projectId, jobId, null);
+    }
+
+    /**
+     * jobs.get / getQueryResults / cancel / delete. A {@code location} that is given must match the
+     * job's location (case-insensitively); a job in another location is not found there.
+     */
+    public StoredJob getJob(String projectId, String jobId, String location) {
+        boolean located = location != null && !location.isBlank();
         return jobStore.get(jobId)
-                .orElseThrow(() -> GcpException.notFound("Not found: Job " + projectId + ":" + jobId));
+                .filter(job -> !located || location.equalsIgnoreCase(job.getLocation()))
+                .orElseThrow(() -> GcpException.notFound("Not found: Job " + projectId + ":"
+                        + (located ? location + "." : "") + jobId).withReason("notFound"));
     }
 
     public List<StoredJob> listJobs(String projectId) {
@@ -1352,7 +1446,11 @@ public class BigQueryService {
     }
 
     public void deleteJob(String projectId, String jobId) {
-        StoredJob job = getJob(projectId, jobId);
+        deleteJob(projectId, jobId, null);
+    }
+
+    public void deleteJob(String projectId, String jobId, String location) {
+        StoredJob job = getJob(projectId, jobId, location);
         // "Requests the deletion of the metadata of a job", so only the anonymous result table this
         // emulator created goes with it. A destination table the caller named is their resource and
         // outlives the job.

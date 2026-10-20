@@ -1,15 +1,23 @@
 package io.floci.gcp.services.iamcredentials;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.storage.InMemoryStorage;
 import io.floci.gcp.services.credentials.CredentialTokenService;
 import io.floci.gcp.services.credentials.StoredCredentialToken;
+import io.floci.gcp.services.iam.IamService;
+import io.floci.gcp.services.iam.SigningKeyFixtures;
+import io.floci.gcp.services.iam.model.StoredSigningKey;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -26,6 +34,82 @@ class IamCredentialsServiceTest {
 			new CredentialTokenService(tokenStore, Clock.fixed(NOW, ZoneOffset.UTC));
 	private final IamCredentialsService service =
 			new IamCredentialsService(tokenService, Clock.fixed(NOW, ZoneOffset.UTC));
+
+    private static final String SIGNER = "signer@p1.iam.gserviceaccount.com";
+
+    private final InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>();
+    private final IamService iam = SigningKeyFixtures.iamService(signingKeys);
+    private final IamCredentialsService signingService =
+            new IamCredentialsService(tokenService, iam, Clock.fixed(NOW, ZoneOffset.UTC));
+
+    @Test
+    void signBlobSignsThePayloadWithTheAccountsKey() throws Exception {
+        iam.createServiceAccount("p1", "signer", "", "");
+        byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
+
+        Map<String, String> response = signingService.signBlob(SIGNER, Base64.getEncoder().encodeToString(data));
+
+        assertEquals(List.of("keyId", "signedBlob"), List.copyOf(response.keySet()));
+        StoredSigningKey key = signingKeys.scan(k -> true).get(0);
+        assertEquals(key.getKeyId(), response.get("keyId"));
+        assertTrue(SigningKeyFixtures.verifies(SigningKeyFixtures.publicKey(key), data,
+                Base64.getDecoder().decode(response.get("signedBlob"))));
+    }
+
+    @Test
+    void signBlobRequiresABase64Payload() {
+        iam.createServiceAccount("p1", "signer", "", "");
+
+        assertInvalidArgument(() -> signingService.signBlob(SIGNER, null));
+        assertInvalidArgument(() -> signingService.signBlob(SIGNER, "not base64!"));
+    }
+
+    @Test
+    void signJwtReturnsAnRs256JwtNamingItsKey() throws Exception {
+        iam.createServiceAccount("p1", "signer", "", "");
+        String claims = "{\"sub\":\"user\",\"exp\":" + NOW.plusSeconds(600).getEpochSecond() + "}";
+
+        Map<String, String> response = signingService.signJwt(SIGNER, claims);
+
+        String[] parts = response.get("signedJwt").split("\\.");
+        assertEquals(3, parts.length);
+        JsonNode header = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(parts[0]));
+        assertEquals("RS256", header.get("alg").asText());
+        assertEquals("JWT", header.get("typ").asText());
+        assertEquals(response.get("keyId"), header.get("kid").asText());
+        assertEquals(claims, new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8));
+        StoredSigningKey key = signingKeys.scan(k -> true).get(0);
+        assertEquals(key.getKeyId(), response.get("keyId"));
+        assertTrue(SigningKeyFixtures.verifies(SigningKeyFixtures.publicKey(key),
+                (parts[0] + "." + parts[1]).getBytes(StandardCharsets.US_ASCII),
+                Base64.getUrlDecoder().decode(parts[2])));
+    }
+
+    @Test
+    void signJwtRejectsAnExpiryInThePastBeyondTwelveHoursOrNotAnInteger() {
+        iam.createServiceAccount("p1", "signer", "", "");
+        long now = NOW.getEpochSecond();
+
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "{\"exp\":" + (now - 1) + "}"));
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "{\"exp\":" + (now + 12 * 3600 + 1) + "}"));
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "{\"exp\":\"soon\"}"));
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "{\"exp\":" + now + ".5}"));
+        signingService.signJwt(SIGNER, "{\"exp\":" + (now + 12 * 3600) + "}");
+    }
+
+    @Test
+    void signJwtRequiresAJsonObjectOfClaims() {
+        iam.createServiceAccount("p1", "signer", "", "");
+
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, null));
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "not json"));
+        assertInvalidArgument(() -> signingService.signJwt(SIGNER, "[1,2]"));
+    }
+
+    private static void assertInvalidArgument(org.junit.jupiter.api.function.Executable call) {
+        GcpException e = assertThrows(GcpException.class, call);
+        assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, e.getGrpcCode());
+    }
 
     @Test
     void generatesTokenAndExpiryForNormalRequest() {

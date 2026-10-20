@@ -13,6 +13,7 @@ floci-gcp emulates the Cloud Run Admin API v2 control plane over REST JSON using
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_CLEANUP_TIMEOUT` | `15s` | Maximum time to wait for best-effort Docker cleanup after an operation is already resolved |
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_URL_HOST_SUFFIX` | `localhost.floci.io` or `FLOCI_GCP_HOSTNAME` | Host suffix used for generated Cloud Run execution URLs |
 | `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_MAX_WORKER_INSTANCES` | `1` | Maximum replica containers run per worker pool (see [Worker Pools](#worker-pools)) |
+| `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_SECURITY_OPTS` | unset | Comma-separated Docker security options for every workload container (see [Security options](#security-options)) |
 
 ## Supported API Surface
 
@@ -29,6 +30,14 @@ floci-gcp emulates the Cloud Run Admin API v2 control plane over REST JSON using
 | List revisions | `GET /v2/projects/{project}/locations/{location}/services/{service}/revisions` |
 | Get revision | `GET /v2/projects/{project}/locations/{location}/services/{service}/revisions/{revision}` |
 | Delete revision | `DELETE /v2/projects/{project}/locations/{location}/services/{service}/revisions/{revision}` |
+
+### IAM enforcement for services
+
+With `floci-gcp.services.iam.authorization-mode=enforce`, Cloud Run v2 service and revision REST JSON requests made with emulator-issued service-account credentials evaluate stored service and project policies. Service create and list check `run.services.create` and `run.services.list` on the location parent. Get, update, and delete check the corresponding `run.services.*` permission on the named service. Service policy get and set check `run.services.getIamPolicy` and `run.services.setIamPolicy`. Revision list, get, and delete check `run.revisions.list`, `run.revisions.get`, and `run.revisions.delete`; revision checks use the containing service policy and project policy. Listing revisions across all services with `services/-` checks `run.revisions.list` on the location parent. `testIamPermissions` returns only granted permissions for the caller. Denied requests return `403 PERMISSION_DENIED` before the handler mutates state.
+
+The supported roles are `roles/run.viewer` for service and revision reads, `roles/run.developer` for service and revision management without policy writes, and `roles/run.admin` for those operations plus service policy writes. The corresponding Cloud Run permissions from basic `roles/viewer`, `roles/editor`, and `roles/owner` are also supported. Conditions use the emulator's restricted CEL profile, including `resource.name`, `resource.type`, `resource.service`, and `request.time`; see [IAM enforcement](../iam-enforcement.md). For create, `resource.name` is the location parent (`projects/{project}/locations/{location}`), because the service does not yet exist. Grant create on the parent, then scope existing-resource operations by service name.
+
+This enforcement does not cover Cloud Run jobs, worker pools, instances, invocation, operations, or gRPC service management. Service policy methods are also available through the shared IAM gRPC API. The emulator does not additionally check `run.operations.get`, `iam.serviceAccounts.actAs`, or Artifact Registry download permission during deployment, although [Cloud Run's deployment guide](https://docs.cloud.google.com/run/docs/reference/iam/roles) lists them for real GCP. External or anonymous credentials retain the emulator's permissive behavior.
 
 As on GCP, list services rejects the `-` location wildcard with `INVALID_ARGUMENT`. List revisions accepts `-` as the service (`.../services/-/revisions`) to list revisions across all services in the location.
 
@@ -65,6 +74,20 @@ The invocation proxy accepts both generated host-routed URLs and the legacy pref
 `validateOnly=true` returns a successful completed operation without storing or deleting resources. Validate-only operations are not retained for later operation get/list calls.
 
 Deleting a service revision that is the service's `latestReadyRevision` or is named in its `trafficStatuses` fails with `400 FAILED_PRECONDITION` and `Revision "{revision}" cannot be directly deleted because it is actively serving.`. Other revisions are removed and the completed operation returns the revision with `deleteTime` and `expireTime` set. Runtime containers are not touched by revision delete; retired service revisions have no running container.
+
+### Security options
+
+Cloud Run lets a container create an unprivileged user namespace (`unshare(CLONE_NEWUSER)`), which rootless sandboxes such as bubblewrap rely on. Docker's default seccomp profile rejects that call with `EPERM`, so floci-gcp workload containers cannot do it by default. Set `FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_SECURITY_OPTS` to pass Docker security options to every Cloud Run workload container (services, job tasks, worker pool replicas, and instances), and to no other container floci-gcp starts:
+
+```bash
+FLOCI_GCP_SERVICES_CLOUDRUN_EXECUTION_SECURITY_OPTS=seccomp=unconfined
+```
+
+Hosts that enforce AppArmor may also need `apparmor=unconfined`, for example `seccomp=unconfined,apparmor=unconfined`. Leaving the variable unset keeps Docker's default profile, because running arbitrary images unconfined on the host's Docker daemon is a poor default.
+
+floci-gcp strips whitespace around each entry and drops empty entries, so `seccomp=unconfined, apparmor=unconfined` works. It does not validate the values. Docker checks them only when it creates a workload container. An invalid option such as `foo=bar` does not stop floci-gcp from starting, but every job run and service create then fails with code 13 (`INTERNAL`) and Docker's error message.
+
+For seccomp, `seccomp=unconfined` is the supported value. A custom profile file does not work. `docker run --security-opt seccomp=profile.json` reads the file in the Docker CLI and sends its contents, but floci-gcp passes the value to the Docker API unchanged, and the API expects the profile JSON itself.
 
 ## SDK Usage
 

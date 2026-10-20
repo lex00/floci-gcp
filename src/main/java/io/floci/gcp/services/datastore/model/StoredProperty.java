@@ -2,23 +2,29 @@ package io.floci.gcp.services.datastore.model;
 
 
 import com.google.datastore.v1.ArrayValue;
+import com.google.datastore.v1.Entity;
 import com.google.datastore.v1.Key;
 import com.google.datastore.v1.Value;
 import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.NullValue;
 import com.google.protobuf.Timestamp;
 import com.google.type.LatLng;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import org.jboss.logging.Logger;
 
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
-import io.quarkus.runtime.annotations.RegisterForReflection;
 
 @RegisterForReflection
 
 public class StoredProperty {
+
+    private static final Logger LOG = Logger.getLogger(StoredProperty.class);
 
     private String type;
     private Boolean booleanValue;
@@ -27,6 +33,16 @@ public class StoredProperty {
     private String stringValue;
     private List<StoredProperty> arrayValues;
     private Map<String, StoredProperty> entityProperties;
+    /**
+     * A key value, or an embedded entity's own key, as the base64 of the serialized {@code Key}.
+     * Unlike the flattened path in {@code stringValue}, this keeps ancestors and tells an id from a
+     * name with the same digits, so the key can be rebuilt on read.
+     */
+    private String keyValue;
+    /** {@code Value.meaning}, or null when unset (0). */
+    private Integer meaning;
+    /** {@code Value.exclude_from_indexes}, or null when false. */
+    private Boolean excludeFromIndexes;
 
     public StoredProperty() {}
 
@@ -66,7 +82,7 @@ public class StoredProperty {
             }
             case KEY_VALUE -> {
                 p.type = "key";
-                p.stringValue = keyToString(v.getKeyValue());
+                p.keyValue = encodeKey(v.getKeyValue());
             }
             case ARRAY_VALUE -> {
                 p.type = "array";
@@ -78,8 +94,17 @@ public class StoredProperty {
                 p.type = "entity";
                 p.entityProperties = v.getEntityValue().getPropertiesMap().entrySet().stream()
                         .collect(Collectors.toMap(Map.Entry::getKey, e -> fromProto(e.getValue())));
+                if (v.getEntityValue().hasKey()) {
+                    p.keyValue = encodeKey(v.getEntityValue().getKey());
+                }
             }
             default -> p.type = "null";
+        }
+        if (v.getMeaning() != 0) {
+            p.meaning = v.getMeaning();
+        }
+        if (v.getExcludeFromIndexes()) {
+            p.excludeFromIndexes = true;
         }
         return p;
     }
@@ -123,7 +148,34 @@ public class StoredProperty {
                 }
                 b.setArrayValue(av.build());
             }
+            case "key" -> {
+                // A key stored before keyValue existed holds only the flattened path, which cannot be
+                // rebuilt into a Key, so it still reads back as null.
+                Key key = decodeKey(keyValue);
+                if (key != null) {
+                    b.setKeyValue(key);
+                } else {
+                    b.setNullValue(NullValue.NULL_VALUE);
+                }
+            }
+            case "entity" -> {
+                Entity.Builder eb = Entity.newBuilder();
+                Key key = decodeKey(keyValue);
+                if (key != null) {
+                    eb.setKey(key);
+                }
+                if (entityProperties != null) {
+                    entityProperties.forEach((name, sp) -> eb.putProperties(name, sp.toProto()));
+                }
+                b.setEntityValue(eb.build());
+            }
             default -> b.setNullValue(NullValue.NULL_VALUE);
+        }
+        if (meaning != null) {
+            b.setMeaning(meaning);
+        }
+        if (Boolean.TRUE.equals(excludeFromIndexes)) {
+            b.setExcludeFromIndexes(true);
         }
         return b.build();
     }
@@ -140,10 +192,92 @@ public class StoredProperty {
             case "string" -> filterValue.hasStringValue()
                     && stringValue != null && stringValue.equals(filterValue.getStringValue());
             case "null" -> filterValue.hasNullValue();
+            case "timestamp" -> matchesTimestamp(filterValue);
+            case "bytes" -> filterValue.hasBlobValue()
+                    && stringValue != null
+                    && stringValue.equals(Base64.getEncoder().encodeToString(
+                            filterValue.getBlobValue().toByteArray()));
+            case "key" -> matchesKey(filterValue);
+            case "array" -> matchesArray(filterValue);
+            case "entity" -> matchesEntity(filterValue);
             default -> false;
         };
     }
 
+    private boolean matchesTimestamp(Value filterValue) {
+        if (stringValue == null || !filterValue.hasTimestampValue()) {
+            return false;
+        }
+        try {
+            Instant stored = Instant.parse(stringValue);
+            Timestamp timestamp = filterValue.getTimestampValue();
+            Instant filter = Instant.ofEpochSecond(timestamp.getSeconds(), timestamp.getNanos());
+            return stored.equals(filter);
+        } catch (DateTimeException expected) {
+            // An unparseable or out-of-range timestamp is not equal, and the query must not fail.
+            return false;
+        }
+    }
+
+    private boolean matchesKey(Value filterValue) {
+        if (!filterValue.hasKeyValue()) {
+            return false;
+        }
+        Key key = decodeKey(keyValue);
+        if (key != null) {
+            return key.equals(filterValue.getKeyValue());
+        }
+        return stringValue != null && stringValue.equals(keyToString(filterValue.getKeyValue()));
+    }
+
+    private boolean matchesArray(Value filterValue) {
+        if (arrayValues == null) {
+            return false;
+        }
+        for (StoredProperty element : arrayValues) {
+            if (element != null && element.matchesEqual(filterValue)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean matchesEntity(Value filterValue) {
+        if (entityProperties == null || !filterValue.hasEntityValue()) {
+            return false;
+        }
+        Map<String, Value> filterProperties = filterValue.getEntityValue().getPropertiesMap();
+        if (!entityProperties.keySet().equals(filterProperties.keySet())) {
+            return false;
+        }
+        for (Map.Entry<String, StoredProperty> entry : entityProperties.entrySet()) {
+            StoredProperty property = entry.getValue();
+            if (property == null || !property.matchesEqual(filterProperties.get(entry.getKey()))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String encodeKey(Key key) {
+        return Base64.getEncoder().encodeToString(key.toByteArray());
+    }
+
+    private static Key decodeKey(String encoded) {
+        if (encoded == null) {
+            return null;
+        }
+        try {
+            return Key.parseFrom(Base64.getDecoder().decode(encoded));
+        } catch (InvalidProtocolBufferException | IllegalArgumentException e) {
+            // Only encodeKey writes this field, so a value that does not decode means the stored data
+            // was damaged or edited by hand. The property reads back as null rather than failing the read.
+            LOG.warnf("Stored Datastore key value is not a valid Key and reads back as null: %s", e.getMessage());
+            return null;
+        }
+    }
+
+    /** The flattened path that key values were stored as before {@code keyValue}; kept for matching them. */
     private static String keyToString(Key key) {
         StringBuilder sb = new StringBuilder();
         sb.append(key.getPartitionId().getProjectId()).append('/');
@@ -173,4 +307,10 @@ public class StoredProperty {
     public void setArrayValues(List<StoredProperty> arrayValues) { this.arrayValues = arrayValues; }
     public Map<String, StoredProperty> getEntityProperties() { return entityProperties; }
     public void setEntityProperties(Map<String, StoredProperty> entityProperties) { this.entityProperties = entityProperties; }
+    public String getKeyValue() { return keyValue; }
+    public void setKeyValue(String keyValue) { this.keyValue = keyValue; }
+    public Integer getMeaning() { return meaning; }
+    public void setMeaning(Integer meaning) { this.meaning = meaning; }
+    public Boolean getExcludeFromIndexes() { return excludeFromIndexes; }
+    public void setExcludeFromIndexes(Boolean excludeFromIndexes) { this.excludeFromIndexes = excludeFromIndexes; }
 }

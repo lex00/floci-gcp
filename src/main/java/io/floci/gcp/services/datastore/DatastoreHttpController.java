@@ -1,6 +1,5 @@
 package io.floci.gcp.services.datastore;
 
-import com.google.datastore.v1.AggregationQuery;
 import com.google.datastore.v1.AggregationResult;
 import com.google.datastore.v1.AggregationResultBatch;
 import com.google.datastore.v1.AllocateIdsRequest;
@@ -25,7 +24,6 @@ import com.google.datastore.v1.RunAggregationQueryRequest;
 import com.google.datastore.v1.RunAggregationQueryResponse;
 import com.google.datastore.v1.RunQueryRequest;
 import com.google.datastore.v1.RunQueryResponse;
-import com.google.datastore.v1.Value;
 import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GqlParser;
 import io.floci.gcp.services.datastore.model.StoredEntity;
@@ -61,7 +59,7 @@ public class DatastoreHttpController {
     DatastoreService service;
 
     @POST
-    @Path("/{rest:.*}")
+    @Path("/{rest:.+}")
     @Consumes("application/x-protobuf")
     @Produces("application/x-protobuf")
     public Response handle(@PathParam("rest") String rest, byte[] body) {
@@ -162,25 +160,21 @@ public class DatastoreHttpController {
 
     private byte[] handleRunAggregationQuery(String projectId, byte[] body) throws Exception {
         RunAggregationQueryRequest request = RunAggregationQueryRequest.parseFrom(body);
-        Instant readTime = Instant.now();
-        List<StoredEntity> results = service.runQuery(
-                projectId,
-                request.getPartitionId(),
-                request.getAggregationQuery().getNestedQuery());
-
-        AggregationResultBatch.Builder batch = AggregationResultBatch.newBuilder()
-                .setMoreResults(QueryResultBatch.MoreResultsType.NO_MORE_RESULTS)
-                .setReadTime(DatastoreService.toTimestamp(readTime.toString()));
-
-        AggregationResult.Builder agg = AggregationResult.newBuilder();
-        for (AggregationQuery.Aggregation aggregation : request.getAggregationQuery().getAggregationsList()) {
-            String alias = aggregation.getAlias().isEmpty() ? "property_1" : aggregation.getAlias();
-            agg.putAggregateProperties(alias,
-                    Value.newBuilder().setIntegerValue(results.size()).build());
+        if (request.hasGqlQuery()) {
+            throw GcpException.unimplemented("GQL aggregation queries are not supported");
         }
-        batch.addAggregationResults(agg.build());
+        Instant readTime = Instant.now();
+        AggregationResult result = AggregationResult.newBuilder()
+                .putAllAggregateProperties(service.runAggregationQuery(
+                        projectId, request.getPartitionId(), request.getAggregationQuery()))
+                .build();
 
-        return RunAggregationQueryResponse.newBuilder().setBatch(batch.build()).build().toByteArray();
+        AggregationResultBatch batch = AggregationResultBatch.newBuilder()
+                .setMoreResults(QueryResultBatch.MoreResultsType.NO_MORE_RESULTS)
+                .setReadTime(DatastoreService.toTimestamp(readTime.toString()))
+                .addAggregationResults(result)
+                .build();
+        return RunAggregationQueryResponse.newBuilder().setBatch(batch).build().toByteArray();
     }
 
     private byte[] handleBeginTransaction(String projectId, byte[] body) throws Exception {
@@ -226,6 +220,7 @@ public class DatastoreHttpController {
             case 6 -> Response.Status.CONFLICT;         // ALREADY_EXISTS
             case 7 -> Response.Status.FORBIDDEN;        // PERMISSION_DENIED
             case 3 -> Response.Status.BAD_REQUEST;      // INVALID_ARGUMENT
+            case 12 -> Response.Status.NOT_IMPLEMENTED; // UNIMPLEMENTED
             default -> Response.Status.INTERNAL_SERVER_ERROR;
         };
     }

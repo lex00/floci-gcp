@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -227,6 +228,137 @@ class FirestoreServiceTest {
 
         assertEquals(List.of(DB + "/documents/customers/different"),
                 results.stream().map(StoredDocument::getName).toList());
+    }
+
+    @Test
+    void timestampValueIsRoundedDownToMicrosecondsOnWrite() {
+        Timestamp at = Timestamp.newBuilder().setSeconds(1756555200).setNanos(123_456_789).build();
+        Value nested = Value.newBuilder().setArrayValue(ArrayValue.newBuilder()
+                .addValues(Value.newBuilder().setTimestampValue(at))).build();
+        Document doc = Document.newBuilder()
+                .setName(DOC_NAME)
+                .putFields("at", Value.newBuilder().setTimestampValue(at).build())
+                .putFields("history", nested)
+                .build();
+        service.applyWrite(Write.newBuilder().setUpdate(doc).build(), Instant.now());
+
+        StoredDocument stored = service.getDocument(DOC_NAME).orElseThrow();
+
+        Timestamp expected = at.toBuilder().setNanos(123_456_000).build();
+        assertEquals(expected, stored.getFields().get("at").toProto().getTimestampValue());
+        assertEquals(expected, stored.getFields().get("history").toProto()
+                .getArrayValue().getValues(0).getTimestampValue());
+    }
+
+    @Test
+    void timestampFiltersIgnorePrecisionBelowMicroseconds() {
+        writeSubMicrosecondTimestampFixture();
+        Value probe = timestamp(1756555200, 456);
+
+        assertEquals(List.of("written"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.EQUAL, probe)));
+        assertEquals(List.of("nextMicro"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.NOT_EQUAL, probe)));
+        assertEquals(List.of(), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.LESS_THAN, probe)));
+        assertEquals(List.of("written", "nextMicro"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.GREATER_THAN_OR_EQUAL, probe)));
+    }
+
+    @Test
+    void timestampCursorIgnoresPrecisionBelowMicroseconds() {
+        writeSubMicrosecondTimestampFixture();
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder()
+                        .setCollectionId("customers").build())
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("at"))
+                        .setDirection(StructuredQuery.Direction.ASCENDING))
+                .setStartAt(Cursor.newBuilder().addValues(timestamp(1756555200, 456)).setBefore(true))
+                .build();
+
+        assertEquals(List.of("written", "nextMicro"), ids(service.runQuery(DB + "/documents", query)));
+    }
+
+    @Test
+    void serverTimestampIsStoredAtMicrosecondsAndMatchesItsReadBackValue() {
+        String name = DB + "/documents/customers/stamped";
+        service.applyWrite(Write.newBuilder()
+                .setUpdate(Document.newBuilder().setName(name))
+                .addUpdateTransforms(DocumentTransform.FieldTransform.newBuilder()
+                        .setFieldPath("at")
+                        .setSetToServerValue(DocumentTransform.FieldTransform.ServerValue.REQUEST_TIME))
+                .build(), Instant.ofEpochSecond(1756555200, 123_456_789));
+
+        Value readBack = service.getDocument(name).orElseThrow().getFields().get("at").toProto();
+
+        assertEquals(List.of("stamped"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.EQUAL, readBack)));
+        assertEquals(123_456_000, readBack.getTimestampValue().getNanos());
+    }
+
+    @Test
+    void storedTimestampWithNanosecondsMatchesItsOwnReadBackValue() {
+        storeTimestampDocument("legacy", Instant.ofEpochSecond(1756555200, 123_456_789));
+        Value readBack = service.getDocument(DB + "/documents/customers/legacy").orElseThrow()
+                .getFields().get("at").toProto();
+
+        assertEquals(List.of("legacy"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.EQUAL, readBack)));
+        assertEquals(List.of("legacy"), ids(runTopLevelFilter("at",
+                StructuredQuery.FieldFilter.Operator.LESS_THAN_OR_EQUAL, readBack)));
+        StructuredQuery endAt = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder()
+                        .setCollectionId("customers").build())
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("at"))
+                        .setDirection(StructuredQuery.Direction.ASCENDING))
+                .setEndAt(Cursor.newBuilder().addValues(readBack).setBefore(false))
+                .build();
+        assertEquals(List.of("legacy"), ids(service.runQuery(DB + "/documents", endAt)));
+    }
+
+    @Test
+    void serverTimestampsStoredInTheSameMicrosecondSortAsEqual() {
+        storeTimestampDocument("a", Instant.ofEpochSecond(1756555200, 123_456_700));
+        storeTimestampDocument("b", Instant.ofEpochSecond(1756555200, 123_456_200));
+
+        assertEquals(List.of("a", "b"), ids(orderByTimestampThenName(StructuredQuery.Direction.ASCENDING)));
+        assertEquals(List.of("b", "a"), ids(orderByTimestampThenName(StructuredQuery.Direction.DESCENDING)));
+    }
+
+    /** Stores a timestamp with its nanoseconds intact, as a document persisted before truncation was. */
+    private void storeTimestampDocument(String id, Instant at) {
+        String name = DB + "/documents/customers/" + id;
+        StoredValue value = new StoredValue();
+        value.setType("timestamp");
+        value.setStringValue(at.toString());
+        storage.put(name, new StoredDocument(name, at.toString(), at.toString(), Map.of("at", value)));
+    }
+
+    private List<StoredDocument> orderByTimestampThenName(StructuredQuery.Direction nameDirection) {
+        StructuredQuery query = StructuredQuery.newBuilder()
+                .addFrom(StructuredQuery.CollectionSelector.newBuilder()
+                        .setCollectionId("customers").build())
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("at"))
+                        .setDirection(StructuredQuery.Direction.ASCENDING))
+                .addOrderBy(StructuredQuery.Order.newBuilder()
+                        .setField(StructuredQuery.FieldReference.newBuilder().setFieldPath("__name__"))
+                        .setDirection(nameDirection))
+                .build();
+        return service.runQuery(DB + "/documents", query);
+    }
+
+    private void writeSubMicrosecondTimestampFixture() {
+        service.applyWrite(topLevelValueDocument("written", "at", timestamp(1756555200, 123)), Instant.now());
+        service.applyWrite(topLevelValueDocument("nextMicro", "at", timestamp(1756555200, 1_000)), Instant.now());
+    }
+
+    private static Value timestamp(long seconds, int nanos) {
+        return Value.newBuilder()
+                .setTimestampValue(Timestamp.newBuilder().setSeconds(seconds).setNanos(nanos))
+                .build();
     }
 
     @Test

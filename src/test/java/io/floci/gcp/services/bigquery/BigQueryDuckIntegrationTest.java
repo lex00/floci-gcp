@@ -4,6 +4,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -12,6 +13,7 @@ import org.junit.jupiter.api.condition.EnabledIf;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 
@@ -19,6 +21,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -62,6 +65,9 @@ class BigQueryDuckIntegrationTest {
     private static Response query(String body) {
         return given().contentType("application/json").body(body).when().post(BASE + "/queries");
     }
+
+    @Inject
+    DuckSqlEngine engine;
 
     @Test
     @Order(1)
@@ -174,6 +180,34 @@ class BigQueryDuckIntegrationTest {
 
     @Test
     @Order(5)
+    void arraysWithNullElementsFailTheQueryOnlyInTheResult() {
+        assertNullElementError("SELECT ARRAY_AGG(x) AS a FROM UNNEST([1, NULL, 3]) x", "a");
+        assertNullElementError("SELECT [1, NULL, 3] AS a", "a");
+        assertNullElementError("SELECT 1 AS x, [CAST(NULL AS INT64)] AS b", "b");
+        assertNullElementError("SELECT [STRUCT(1 AS v), NULL] AS a", "a");
+        assertNullElementError("SELECT STRUCT(1 AS id, [1, NULL] AS arr) AS s", "s.arr; error in writing field s");
+        assertNullElementError("SELECT [STRUCT([1, NULL] AS inner_arr)] AS a",
+                "a.inner_arr; error in writing field a");
+        query("""
+                {"query": "SELECT ARRAY_LENGTH(a) AS n FROM (SELECT ARRAY_AGG(x) AS a FROM UNNEST([1, NULL, 3]) x)", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f.v", equalTo(List.of("3")));
+        query("""
+                {"query": "SELECT ARRAY_AGG(STRUCT(x AS v) ORDER BY x) AS a FROM UNNEST([1, NULL]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v.f.v", equalTo(List.of(List.of("1"), Arrays.asList((String) null))));
+    }
+
+    private static void assertNullElementError(String sql, String field) {
+        query("{\"query\": \"" + sql + "\", \"useLegacySql\": false}")
+                .then().statusCode(400)
+                .body("error.message", equalTo("Array cannot have a null element; error in writing field " + field));
+    }
+
+    @Test
+    @Order(5)
     void parenthesizedQueriesAndNestedCtesRun() {
         query("""
                 {"query": "(SELECT 1 + 1)", "useLegacySql": false}
@@ -198,6 +232,45 @@ class BigQueryDuckIntegrationTest {
                 .then().statusCode(200)
                 .body("schema.fields.name", equalTo(List.of("x", "y")))
                 .body("rows[0].f.v", equalTo(List.of("1", "1")));
+    }
+
+    @Test
+    @Order(5)
+    void anonymousSubqueryColumnsAreNamedInTheResultLikeBigQuery() {
+        assertResultColumns("SELECT * FROM (SELECT 1 + 1)", List.of("f0_"), List.of("2"));
+        assertResultColumns("SELECT * FROM (SELECT 1 + 1, 'a' || 'b')", List.of("f0_", "f1_"), List.of("2", "ab"));
+        assertResultColumns("SELECT * FROM (SELECT 1 + 1, 2 AS x, 3 + 3)", List.of("f0_", "x", "f1_"),
+                List.of("2", "2", "6"));
+        assertResultColumns("SELECT * FROM (SELECT * FROM (SELECT 1 + 1))", List.of("f0_"), List.of("2"));
+        assertResultColumns("WITH s AS (SELECT 1 + 1) SELECT * FROM s", List.of("f0_"), List.of("2"));
+        assertResultColumns("SELECT t.* FROM (SELECT 1 + 1) t", List.of("f0_"), List.of("2"));
+        assertResultColumns("SELECT * FROM (SELECT 1)", List.of("f0_"), List.of("1"));
+        assertResultColumns("SELECT *, 9 + 9 FROM (SELECT 2 + 2, 3 AS x)", List.of("f0_", "x", "f1_"),
+                List.of("4", "3", "18"));
+        assertResultColumns("SELECT * FROM (SELECT 1 + 1 UNION ALL SELECT 2 + 2) ORDER BY 1", List.of("f0_"),
+                List.of("2"));
+        assertResultColumns("SELECT (SELECT 1 + 1) AS v, 1 + 1", List.of("v", "f0_"), List.of("2", "2"));
+        assertResultColumns("SELECT *, 9 AS f0_ FROM (SELECT 1 + 1)", List.of("f1_", "f0_"), List.of("2", "9"));
+        assertResultColumns("SELECT 1 + 1, 9 AS f0_", List.of("f1_", "f0_"), List.of("2", "9"));
+        assertResultColumns("SELECT *, 9 AS f1_ FROM (SELECT 1 + 1, 2 + 2)", List.of("f0_", "f2_", "f1_"),
+                List.of("2", "4", "9"));
+        assertResultColumns("SELECT * FROM (SELECT 1 + 1, 9 AS f0_)", List.of("f1_", "f0_"), List.of("2", "9"));
+        assertResultColumns("SELECT * FROM (SELECT * EXCEPT (x), 9 + 9 FROM (SELECT 2 + 2, 3 AS x))",
+                List.of("f0_", "f1_"), List.of("4", "18"));
+        for (String sql : List.of("SELECT 1 + 1, * FROM (SELECT 2 + 2)",
+                "SELECT * FROM (SELECT 1 + 1) a, (SELECT 2 + 2) b")) {
+            query("{\"query\": \"" + sql + "\", \"useLegacySql\": false}")
+                    .then().statusCode(400)
+                    .body("error.message", containsString("Duplicate column names in the result are not supported."
+                            + " Found duplicate(s): $col1"));
+        }
+    }
+
+    private static void assertResultColumns(String sql, List<String> names, List<String> firstRow) {
+        query("{\"query\": \"" + sql + "\", \"useLegacySql\": false}")
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(names))
+                .body("rows[0].f.v", equalTo(firstRow));
     }
 
     @Test
@@ -307,6 +380,148 @@ class BigQueryDuckIntegrationTest {
     }
 
     @Test
+    @Order(5)
+    void arrayAggNullModifiersMatchBigQuery() {
+        query("""
+                {"query": "SELECT ARRAY_AGG(x IGNORE NULLS ORDER BY x) a, ARRAY_AGG(DISTINCT x IGNORE NULLS ORDER BY x DESC) b, ARRAY_AGG(IF(x = 1, 'keep ignore nulls', NULL) IGNORE NULLS) c FROM UNNEST([1, NULL, 3, 3]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v", equalTo(List.of("1", "3", "3")))
+                .body("rows[0].f[1].v.v", equalTo(List.of("3", "1")))
+                .body("rows[0].f[2].v.v", equalTo(List.of("keep ignore nulls")));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x RESPECT NULLS ORDER BY x) a FROM UNNEST([2, 1]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v", equalTo(List.of("1", "2")));
+        query("""
+                {"query": "SELECT x, ARRAY_AGG(x IGNORE NULLS) OVER (ORDER BY x) a FROM UNNEST([1, 2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"))
+                .body("error.message", containsString("does not support IGNORE NULLS or RESPECT NULLS"));
+    }
+
+    @Test
+    @Order(5)
+    void arrayAggFieldsNamedLikeKeywordsAreFields() {
+        query("""
+                {"query": "SELECT ARRAY_AGG(t.limit ORDER BY t.limit) AS a, ARRAY_AGG(t.limit ORDER BY t.limit DESC LIMIT 1) AS b, ARRAY_AGG(t.ignore ORDER BY t.ignore DESC) AS c, ARRAY_AGG(t.respect IGNORE NULLS ORDER BY t.ignore) AS d FROM UNNEST([STRUCT(2 AS `limit`, 1 AS `ignore`, 5 AS `respect`), STRUCT(1 AS `limit`, 3 AS `ignore`, CAST(NULL AS INT64) AS `respect`)]) t", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v", equalTo(List.of("1", "2")))
+                .body("rows[0].f[1].v.v", equalTo(List.of("2")))
+                .body("rows[0].f[2].v.v", equalTo(List.of("3", "1")))
+                .body("rows[0].f[3].v.v", equalTo(List.of("5")));
+    }
+
+    @Test
+    @Order(5)
+    void arrayAggLimitMatchesBigQuery() {
+        query("""
+                {"query": "SELECT ARRAY_AGG(x IGNORE NULLS ORDER BY x DESC LIMIT 2) top2, ARRAY_AGG(x IGNORE NULLS ORDER BY x LIMIT 1) lowest, ARRAY_AGG(DISTINCT x IGNORE NULLS ORDER BY x LIMIT 2) d, ARRAY_AGG(x LIMIT 0) z FROM UNNEST([3, 1, NULL, 2, 3]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("schema.fields.name", equalTo(List.of("top2", "lowest", "d", "z")))
+                .body("rows[0].f[0].v.v", equalTo(List.of("3", "3")))
+                .body("rows[0].f[1].v.v", equalTo(List.of("1")))
+                .body("rows[0].f[2].v.v", equalTo(List.of("1", "2")))
+                .body("rows[0].f[3].v", equalTo(List.of()));
+        query("""
+                {"query": "SELECT g, ARRAY_AGG(x ORDER BY x DESC LIMIT 1) top FROM UNNEST([STRUCT('a' AS g, 1 AS x), ('a', 2), ('b', 3)]) GROUP BY g ORDER BY g", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[1].v.v", equalTo(List.of("2")))
+                .body("rows[1].f[1].v.v", equalTo(List.of("3")));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x LIMIT 1) OVER () z FROM UNNEST([1, 2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"))
+                .body("error.message", containsString("LIMIT in arguments is not supported on analytic functions"));
+        query("""
+                {"query": "SELECT ARRAY_AGG(CASE WHEN x > ? THEN x ELSE NULL END IGNORE NULLS ORDER BY x LIMIT ?) a FROM UNNEST([3, 1, NULL, 2, 3]) x",
+                 "parameterMode": "POSITIONAL", "useLegacySql": false,
+                 "queryParameters": [{"parameterType": {"type": "INT64"}, "parameterValue": {"value": "1"}},
+                                     {"parameterType": {"type": "INT64"}, "parameterValue": {"value": "2"}}]}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v", equalTo(List.of("2", "3")));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x ORDER BY x LIMIT -1) a FROM UNNEST([3, 1, 2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"))
+                .body("error.message", containsString("LIMIT expects a non-negative integer literal or parameter"));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x ORDER BY x LIMIT 1 + 1) a FROM UNNEST([3, 1, 2]) x", "useLegacySql": false}
+                """)
+                .then().statusCode(400)
+                .body("error.message", containsString("LIMIT expects an integer literal or parameter"));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x ORDER BY x LIMIT @n) a FROM UNNEST([3, 1, 2]) x",
+                 "parameterMode": "NAMED", "useLegacySql": false,
+                 "queryParameters": [{"name": "n", "parameterType": {"type": "INT64"}, "parameterValue": {"value": "-1"}}]}
+                """)
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"))
+                .body("error.message", containsString("LIMIT value should not be negative"));
+        query("""
+                {"query": "SELECT ARRAY_AGG(x ORDER BY x LIMIT @n) a FROM UNNEST([3, 1, 2]) x",
+                 "parameterMode": "NAMED", "useLegacySql": false,
+                 "queryParameters": [{"name": "n", "parameterType": {"type": "INT64"}, "parameterValue": {"value": "2"}}]}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v.v", equalTo(List.of("1", "2")));
+    }
+
+    @Test
+    @Order(5)
+    void queriesCannotReadFilesOrUrls() {
+        String other = "/bigquery/v2/projects/bq-duck-it-other";
+        given().contentType("application/json").body("{\"datasetReference\": {\"datasetId\": \"vault\"}}")
+                .when().post(other + "/datasets").then().statusCode(200);
+        given().contentType("application/json")
+                .body("{\"tableReference\": {\"tableId\": \"secrets\"}, \"schema\": {\"fields\": [{\"name\": \"v\", \"type\": \"STRING\"}]}}")
+                .when().post(other + "/datasets/vault/tables").then().statusCode(200);
+        given().contentType("application/json").body("{\"rows\": [{\"json\": {\"v\": \"top-secret\"}}]}")
+                .when().post(other + "/datasets/vault/tables/secrets/insertAll").then().statusCode(200);
+        // The address floci-duck itself stages rows from: reachable from the sidecar by construction.
+        String rows = engine.flociEndpoint()
+                + "/_floci-gcp/bigquery/projects/bq-duck-it-other/datasets/vault/tables/secrets/rows.ndjson";
+
+        for (String sql : List.of("SELECT content FROM read_text('" + rows + "')",
+                "SELECT (SELECT content FROM read_text('" + rows + "')) AS c FROM shop.users",
+                "SELECT * FROM '" + rows + "'",
+                "SELECT * FROM read_csv('/etc/hostname')")) {
+            query("{\"query\": \"" + sql + "\", \"useLegacySql\": false}")
+                    .then().statusCode(400)
+                    .body("error.errors[0].reason", equalTo("invalidQuery"))
+                    .body(not(containsString("top-secret")));
+        }
+        // DML is caller SQL too: INSERT ... SELECT must not copy another project's rows into the caller's table.
+        query("""
+                {"query": "CREATE TABLE shop.copied (v STRING)", "useLegacySql": false}
+                """)
+                .then().statusCode(200);
+        query("{\"query\": \"INSERT INTO shop.copied (v) SELECT v FROM '" + rows + "'\", \"useLegacySql\": false}")
+                .then().statusCode(400)
+                .body("error.errors[0].reason", equalTo("invalidQuery"))
+                .body(not(containsString("top-secret")));
+        query("""
+                {"query": "SELECT COUNT(*) FROM shop.copied", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v", equalTo("0"));
+        // The tables a query references are still staged over the same route.
+        query("""
+                {"query": "SELECT COUNT(*) FROM shop.users", "useLegacySql": false}
+                """)
+                .then().statusCode(200)
+                .body("rows[0].f[0].v", equalTo("3"));
+    }
+
+    @Test
     @Order(6)
     void dryRunReturnsSchemaWithoutAJob() {
         query("""
@@ -351,5 +566,29 @@ class BigQueryDuckIntegrationTest {
                 """)
                 .then().statusCode(400)
                 .body("error.message", containsString("Legacy SQL"));
+    }
+    @Test
+    @Order(8)
+    void everyReferencedDatasetMustShareTheJobLocation() {
+        given().contentType("application/json")
+                .body("{\"datasetReference\": {\"datasetId\": \"eu_shop\"}, \"location\": \"EU\"}")
+                .when().post(BASE + "/datasets").then().statusCode(200);
+        given().contentType("application/json").body("""
+                {"tableReference": {"tableId": "refunds"}, "schema": {"fields": [{"name": "user_id", "type": "INT64"}]}}
+                """).when().post(BASE + "/datasets/eu_shop/tables").then().statusCode(200);
+
+        query("""
+                {"query": "SELECT COUNT(*) AS n FROM eu_shop.refunds", "useLegacySql": false}
+                """).then().statusCode(200)
+                .body("jobReference.location", equalTo("EU"))
+                .body("rows[0].f[0].v", equalTo("0"));
+
+        query("""
+                {"query": "SELECT u.id FROM shop.users u JOIN eu_shop.refunds r ON u.id = r.user_id",
+                 "useLegacySql": false}
+                """).then().statusCode(404)
+                .body("error.errors[0].reason", equalTo("notFound"))
+                .body("error.message", equalTo(
+                        "Not found: Dataset " + PROJECT + ":eu_shop was not found in location US"));
     }
 }

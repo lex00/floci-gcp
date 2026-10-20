@@ -8,13 +8,18 @@ import io.floci.gcp.core.storage.StorageException;
 import io.floci.gcp.services.iam.model.StoredPolicy;
 import io.floci.gcp.services.iam.model.StoredServiceAccount;
 import io.floci.gcp.services.iam.model.StoredServiceAccountKey;
+import io.floci.gcp.services.iam.model.StoredSigningKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -36,6 +41,121 @@ class IamServiceTest {
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>(),
                 new InMemoryStorage<>());
+    }
+
+    @Test
+    void signBlobReturnsAnRsaSha256SignatureNamedSignature() throws Exception {
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>();
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        byte[] data = "hello".getBytes(StandardCharsets.UTF_8);
+
+        Map<String, String> response = iam.signBlob("p1", "signer@p1.iam.gserviceaccount.com",
+                Base64.getEncoder().encodeToString(data));
+
+        assertEquals(Set.of("keyId", "signature"), response.keySet());
+        StoredSigningKey key = signingKeys.scan(k -> true).get(0);
+        assertEquals(key.getKeyId(), response.get("keyId"));
+        assertTrue(SigningKeyFixtures.verifies(SigningKeyFixtures.publicKey(key), data,
+                Base64.getDecoder().decode(response.get("signature"))));
+    }
+
+    @Test
+    void eachAccountKeepsOneSigningKeyAcrossCalls() {
+        service.createServiceAccount("p1", "a", "", "");
+        service.createServiceAccount("p1", "b", "", "");
+
+        String first = service.signingKeyId("p1", "a@p1.iam.gserviceaccount.com");
+
+        assertEquals(first, service.sign("p1", "a@p1.iam.gserviceaccount.com", new byte[] {1}).keyId());
+        assertEquals(first, service.signingKeyId("-", "a@p1.iam.gserviceaccount.com"));
+        assertNotEquals(first, service.signingKeyId("p1", "b@p1.iam.gserviceaccount.com"));
+        assertTrue(first.matches("[0-9a-f]{40}"));
+    }
+
+    @Test
+    void theSigningKeyIsNotListedAmongUserManagedKeys() {
+        service.createServiceAccount("p1", "signer", "", "");
+        service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com");
+
+        assertTrue(service.listKeys("p1", "signer@p1.iam.gserviceaccount.com").isEmpty());
+    }
+
+    @Test
+    void aRecreatedAccountSignsWithANewKey() {
+        service.createServiceAccount("p1", "signer", "", "");
+        String before = service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com");
+
+        service.deleteServiceAccount("p1", "signer@p1.iam.gserviceaccount.com");
+        service.createServiceAccount("p1", "signer", "", "");
+
+        assertNotEquals(before, service.signingKeyId("p1", "signer@p1.iam.gserviceaccount.com"));
+    }
+
+    @Test
+    void deletingAnAccountWaitsForAFirstSigningCallSoItsKeyIsNotWrittenBack() throws Exception {
+        CountDownLatch signerInStore = new CountDownLatch(1);
+        CountDownLatch releaseSigner = new CountDownLatch(1);
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>() {
+            @Override
+            public Optional<StoredSigningKey> get(String key) {
+                signerInStore.countDown();
+                await(releaseSigner);
+                return super.get(key);
+            }
+        };
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        String email = "signer@p1.iam.gserviceaccount.com";
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<IamService.SignedBytes> signing = executor.submit(() -> iam.sign("p1", email, new byte[] {1}));
+            await(signerInStore);
+            Future<?> deleting = executor.submit(() -> iam.deleteServiceAccount("p1", email));
+            assertThrows(TimeoutException.class, () -> deleting.get(200, TimeUnit.MILLISECONDS),
+                    "deletion must wait while the signing call holds the key lock");
+
+            releaseSigner.countDown();
+            signing.get(5, TimeUnit.SECONDS);
+            deleting.get(5, TimeUnit.SECONDS);
+        } finally {
+            releaseSigner.countDown();
+            executor.shutdownNow();
+        }
+
+        assertTrue(signingKeys.keys().isEmpty());
+    }
+
+    @Test
+    void theSigningInputGetsTheIdOfTheKeyThatSignsIt() throws Exception {
+        InMemoryStorage<String, StoredSigningKey> signingKeys = new InMemoryStorage<>();
+        IamService iam = SigningKeyFixtures.iamService(signingKeys);
+        iam.createServiceAccount("p1", "signer", "", "");
+        String email = "signer@p1.iam.gserviceaccount.com";
+        String[] named = new String[1];
+
+        IamService.SignedBytes signed = iam.sign("p1", email, keyId -> {
+            named[0] = keyId;
+            // The account is replaced after the key is chosen: the chosen key still signs.
+            iam.deleteServiceAccount("p1", email);
+            iam.createServiceAccount("p1", "signer", "", "");
+            return keyId.getBytes(StandardCharsets.UTF_8);
+        });
+
+        assertEquals(named[0], signed.keyId());
+        assertNotEquals(named[0], iam.signingKeyId("p1", email));
+    }
+
+    @Test
+    void signingForAMissingAccountIsNotFoundAndBadBase64IsInvalid() {
+        GcpException missing = assertThrows(GcpException.class,
+                () -> service.signBlob("p1", "ghost@p1.iam.gserviceaccount.com", "aGk="));
+        assertEquals(io.grpc.Status.Code.NOT_FOUND, missing.getGrpcCode());
+
+        service.createServiceAccount("p1", "signer", "", "");
+        GcpException invalid = assertThrows(GcpException.class,
+                () -> service.signBlob("p1", "signer@p1.iam.gserviceaccount.com", "not base64!"));
+        assertEquals(io.grpc.Status.Code.INVALID_ARGUMENT, invalid.getGrpcCode());
     }
 
     @Test

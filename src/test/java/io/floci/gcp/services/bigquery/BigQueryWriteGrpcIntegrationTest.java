@@ -28,6 +28,7 @@ import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FileDescriptor;
 import com.google.protobuf.DynamicMessage;
 import com.google.protobuf.Int64Value;
+import io.floci.gcp.core.common.RequestScopes;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Status;
@@ -58,6 +59,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.hasKey;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -272,6 +274,9 @@ class BigQueryWriteGrpcIntegrationTest {
                 Arrays.asList("ada", "36", "1700000000123456", "2024-01-01", "2024-01-02T03:04:05.000006", "-12.5",
                         List.of(Map.of("v", "a"), Map.of("v", "b")), Map.of("f", List.of(Map.of("v", "London"))), "9.5"),
                 Arrays.asList("bob", null, null, null, null, null, List.of(), null, null)), tableRows());
+        // A NULL cell keeps its "v" key, which the Python client reads unconditionally.
+        given().when().get(BASE + "/datasets/writes/tables/events/data")
+                .then().body("rows[1].f[1]", hasKey("v"));
     }
 
     @Test
@@ -521,7 +526,7 @@ class BigQueryWriteGrpcIntegrationTest {
      * loop Vert.x assigned it, and two connections landing on one loop could never meet.
      */
     private static <T> FutureTask<T> call(String project, Supplier<T> action) {
-        FutureTask<T> task = new FutureTask<>(() -> BigQueryGrpcContext.withProject(project, action));
+        FutureTask<T> task = new FutureTask<>(() -> RequestScopes.callAs(project, action));
         Thread thread = new Thread(task);
         thread.setDaemon(true);
         thread.start();

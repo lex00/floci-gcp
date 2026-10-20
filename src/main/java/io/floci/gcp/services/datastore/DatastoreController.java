@@ -1,17 +1,21 @@
 package io.floci.gcp.services.datastore;
 
+import com.google.datastore.v1.AggregationResult;
+import com.google.datastore.v1.AggregationResultBatch;
 import com.google.datastore.v1.AllocateIdsRequest;
 import com.google.datastore.v1.AllocateIdsResponse;
 import com.google.datastore.v1.BeginTransactionRequest;
 import com.google.datastore.v1.BeginTransactionResponse;
 import com.google.datastore.v1.CommitRequest;
 import com.google.datastore.v1.CommitResponse;
+import com.google.datastore.v1.DatastoreProto;
 import com.google.datastore.v1.Entity;
 import com.google.datastore.v1.EntityResult;
 import com.google.datastore.v1.Key;
 import com.google.datastore.v1.LookupRequest;
 import com.google.datastore.v1.LookupResponse;
 import com.google.datastore.v1.Mutation;
+import com.google.datastore.v1.Query;
 import com.google.datastore.v1.QueryResultBatch;
 import com.google.datastore.v1.ReserveIdsRequest;
 import com.google.datastore.v1.ReserveIdsResponse;
@@ -22,7 +26,10 @@ import com.google.datastore.v1.RunAggregationQueryResponse;
 import com.google.datastore.v1.RunQueryRequest;
 import com.google.datastore.v1.RunQueryResponse;
 import com.google.protobuf.ByteString;
+import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GcpGrpcController;
+import io.floci.gcp.core.common.GqlParser;
+import io.floci.gcp.core.common.ProtoMethodSchema;
 import io.floci.gcp.services.datastore.model.StoredEntity;
 import io.grpc.BindableService;
 import io.grpc.MethodDescriptor;
@@ -45,6 +52,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<LookupRequest, LookupResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/Lookup")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "Lookup"))
                     .setRequestMarshaller(ProtoUtils.marshaller(LookupRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(LookupResponse.getDefaultInstance()))
                     .build();
@@ -53,6 +61,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<RunQueryRequest, RunQueryResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/RunQuery")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "RunQuery"))
                     .setRequestMarshaller(ProtoUtils.marshaller(RunQueryRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(RunQueryResponse.getDefaultInstance()))
                     .build();
@@ -61,6 +70,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<CommitRequest, CommitResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/Commit")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "Commit"))
                     .setRequestMarshaller(ProtoUtils.marshaller(CommitRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(CommitResponse.getDefaultInstance()))
                     .build();
@@ -69,6 +79,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<BeginTransactionRequest, BeginTransactionResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/BeginTransaction")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "BeginTransaction"))
                     .setRequestMarshaller(ProtoUtils.marshaller(BeginTransactionRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(BeginTransactionResponse.getDefaultInstance()))
                     .build();
@@ -77,6 +88,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<RollbackRequest, RollbackResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/Rollback")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "Rollback"))
                     .setRequestMarshaller(ProtoUtils.marshaller(RollbackRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(RollbackResponse.getDefaultInstance()))
                     .build();
@@ -85,6 +97,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<AllocateIdsRequest, AllocateIdsResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/AllocateIds")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "AllocateIds"))
                     .setRequestMarshaller(ProtoUtils.marshaller(AllocateIdsRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(AllocateIdsResponse.getDefaultInstance()))
                     .build();
@@ -93,6 +106,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<ReserveIdsRequest, ReserveIdsResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/ReserveIds")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "ReserveIds"))
                     .setRequestMarshaller(ProtoUtils.marshaller(ReserveIdsRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(ReserveIdsResponse.getDefaultInstance()))
                     .build();
@@ -101,6 +115,7 @@ public class DatastoreController implements BindableService {
             MethodDescriptor.<RunAggregationQueryRequest, RunAggregationQueryResponse>newBuilder()
                     .setType(MethodDescriptor.MethodType.UNARY)
                     .setFullMethodName(SERVICE_NAME + "/RunAggregationQuery")
+                    .setSchemaDescriptor(ProtoMethodSchema.of(DatastoreProto.getDescriptor(), "Datastore", "RunAggregationQuery"))
                     .setRequestMarshaller(ProtoUtils.marshaller(RunAggregationQueryRequest.getDefaultInstance()))
                     .setResponseMarshaller(ProtoUtils.marshaller(RunAggregationQueryResponse.getDefaultInstance()))
                     .build();
@@ -158,8 +173,11 @@ public class DatastoreController implements BindableService {
         LOG.debugf("runQuery project=%s", request.getProjectId());
         try {
             Instant readTime = Instant.now();
+            Query query = request.hasGqlQuery()
+                    ? GqlParser.toStructuredQuery(request.getGqlQuery())
+                    : request.getQuery();
             List<StoredEntity> results = service.runQuery(
-                    request.getProjectId(), request.getPartitionId(), request.getQuery());
+                    request.getProjectId(), request.getPartitionId(), query);
 
             QueryResultBatch.Builder batch = QueryResultBatch.newBuilder()
                     .setEntityResultType(EntityResult.ResultType.FULL)
@@ -248,7 +266,26 @@ public class DatastoreController implements BindableService {
     private void runAggregationQuery(RunAggregationQueryRequest request,
             StreamObserver<RunAggregationQueryResponse> responseObserver) {
         LOG.debugf("runAggregationQuery project=%s", request.getProjectId());
-        responseObserver.onNext(RunAggregationQueryResponse.getDefaultInstance());
-        responseObserver.onCompleted();
+        try {
+            if (request.hasGqlQuery()) {
+                throw GcpException.unimplemented("GQL aggregation queries are not supported");
+            }
+            Instant readTime = Instant.now();
+            AggregationResult result = AggregationResult.newBuilder()
+                    .putAllAggregateProperties(service.runAggregationQuery(
+                            request.getProjectId(), request.getPartitionId(), request.getAggregationQuery()))
+                    .build();
+
+            AggregationResultBatch batch = AggregationResultBatch.newBuilder()
+                    .setMoreResults(QueryResultBatch.MoreResultsType.NO_MORE_RESULTS)
+                    .setReadTime(DatastoreService.toTimestamp(readTime.toString()))
+                    .addAggregationResults(result)
+                    .build();
+            responseObserver.onNext(RunAggregationQueryResponse.newBuilder().setBatch(batch).build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            LOG.warnf("runAggregationQuery failed: %s", e.getMessage());
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
     }
 }

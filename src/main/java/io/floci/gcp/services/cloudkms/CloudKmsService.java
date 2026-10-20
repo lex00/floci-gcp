@@ -79,6 +79,8 @@ public class CloudKmsService {
                 .storageKey("kms")
                 .protocol(ServiceProtocol.GRPC)
                 .resourceClasses(CloudKmsController.class)
+                .api("cloudkms.googleapis.com", "Cloud Key Management Service (KMS) API",
+                        CloudKmsHttpController.class)
                 .build());
         grpcServerManager.bind(new CloudKmsController(this));
     }
@@ -291,6 +293,23 @@ public class CloudKmsService {
         return KmsCrypto.asymmetricDecrypt(version.getAlgorithm(), version.getKeyMaterialBase64(), ciphertext);
     }
 
+    public byte[] macSign(String versionName, byte[] data) {
+        StoredCryptoKeyVersion version = macVersion(versionName);
+        return KmsCrypto.macSign(version.getAlgorithm(), version.getKeyMaterialBase64(), data);
+    }
+
+    public boolean macVerify(String versionName, byte[] data, byte[] mac) {
+        StoredCryptoKeyVersion version = macVersion(versionName);
+        return KmsCrypto.macVerify(version.getAlgorithm(), version.getKeyMaterialBase64(), data, mac);
+    }
+
+    private StoredCryptoKeyVersion macVersion(String versionName) {
+        StoredCryptoKeyVersion version = getCryptoKeyVersion(versionName);
+        requirePurpose(getCryptoKey(cryptoKeyOf(versionName)), "MAC");
+        requireEnabled(version);
+        return version;
+    }
+
     public byte[] generateRandomBytes(int lengthBytes) {
         if (lengthBytes < 8 || lengthBytes > 1024) {
             throw GcpException.invalidArgument("length_bytes must be between 8 and 1024: " + lengthBytes);
@@ -324,6 +343,15 @@ public class CloudKmsService {
                     return algorithm;
                 }
                 throw GcpException.invalidArgument("Unsupported ASYMMETRIC_DECRYPT algorithm: " + algorithm);
+            }
+            case "MAC" -> {
+                if (unspecified) {
+                    throw GcpException.invalidArgument("Algorithm is required for MAC");
+                }
+                if (KmsCrypto.HMAC_ALGORITHMS.contains(algorithm)) {
+                    return algorithm;
+                }
+                throw GcpException.invalidArgument("Unsupported MAC algorithm: " + algorithm);
             }
             default -> throw GcpException.invalidArgument("Unsupported purpose: " + purpose);
         }

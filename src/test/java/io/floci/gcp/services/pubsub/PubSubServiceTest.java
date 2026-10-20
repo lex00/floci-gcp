@@ -21,8 +21,12 @@ import org.junit.jupiter.api.BeforeEach;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -39,21 +43,24 @@ class PubSubServiceTest {
     private PubSubService service;
     private IamService iamService;
     private InMemoryStorage<String, StoredSubscription> subStore;
+    private MutableClock clock;
 
     @BeforeEach
     void setUp() {
         subStore = new InMemoryStorage<>();
         iamService = IamServices.inMemory();
+        clock = new MutableClock(Instant.parse("2026-01-01T00:00:00Z"));
         service = new PubSubService(
                 new InMemoryStorage<>(),
                 subStore,
                 new InMemoryStorage<>(),
-                iamService);
+                iamService,
+                clock);
     }
 
     @AfterEach
     void tearDown() {
-        service.shutdownPushExecutors();
+        service.shutdownExecutors();
     }
 
     @Test
@@ -479,6 +486,360 @@ class PubSubServiceTest {
 
         List<ReceivedMessage> second = service.pull("projects/p1/subscriptions/s1", 10);
         assertTrue(second.isEmpty());
+    }
+
+    // ── ModifyAckDeadline ──────────────────────────────────────────────────────
+
+    @Test
+    void modifyAckDeadlineWithZeroRequeuesTheMessageForTheNextPull() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, first.size());
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(first.get(0).getAckId()), 0);
+
+        List<ReceivedMessage> redelivered = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, redelivered.size());
+        assertEquals(first.get(0).getMessage().getMessageId(), redelivered.get(0).getMessage().getMessageId());
+        assertNotEquals(first.get(0).getAckId(), redelivered.get(0).getAckId());
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void modifyAckDeadlineWithPositiveDeadlineKeepsTheMessageOutstanding() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 600);
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 0);
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void modifyAckDeadlineRequeuesNackedMessagesInPublishOrderAheadOfTheBacklog() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1", List.of(
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m1")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m2")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m3")).build()));
+        List<ReceivedMessage> first = service.pull("projects/p1/subscriptions/s1", 2);
+        assertEquals(List.of("m1", "m2"), first.stream()
+                .map(m -> m.getMessage().getData().toStringUtf8()).toList());
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1",
+                List.of(first.get(1).getAckId(), first.get(0).getAckId()), 0);
+
+        assertEquals(List.of("m1", "m2", "m3"), service.pull("projects/p1/subscriptions/s1", 10).stream()
+                .map(m -> m.getMessage().getData().toStringUtf8()).toList());
+    }
+
+    @Test
+    void modifyAckDeadlineIgnoresAcknowledgedAndUnknownAckIds() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+        service.acknowledge("projects/p1/subscriptions/s1", List.of(ackId));
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId, "never-issued"), 0);
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void modifyAckDeadlineAfterDetachDoesNotResurrectTheMessage() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+        service.detachSubscription("projects/p1/subscriptions/s1");
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 0);
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    // ── Ack deadline expiry ────────────────────────────────────────────────────
+
+    @Test
+    void unackedMessageIsRedeliveredOnceTheAckDeadlinePasses() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        ReceivedMessage first = service.pull("projects/p1/subscriptions/s1", 10).get(0);
+
+        clock.advance(Duration.ofSeconds(9));
+        service.expireLeases();
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+
+        clock.advance(Duration.ofSeconds(1));
+        service.expireLeases();
+        List<ReceivedMessage> redelivered = service.pull("projects/p1/subscriptions/s1", 10);
+        assertEquals(1, redelivered.size());
+        assertEquals(first.getMessage().getMessageId(), redelivered.get(0).getMessage().getMessageId());
+        assertNotEquals(first.getAckId(), redelivered.get(0).getAckId());
+    }
+
+    @Test
+    void ackedMessageIsNotRedeliveredAfterTheAckDeadline() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+        service.acknowledge("projects/p1/subscriptions/s1", List.of(ackId));
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void acknowledgeWithAnExpiredAckIdStillRedeliversTheMessage() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+
+        clock.advance(Duration.ofSeconds(10));
+        service.acknowledge("projects/p1/subscriptions/s1", List.of(ackId));
+        service.expireLeases();
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void acknowledgeWithTheFirstAckIdDoesNotDropTheRedeliveredMessage() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String firstAckId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+        String secondAckId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+
+        service.acknowledge("projects/p1/subscriptions/s1", List.of(firstAckId));
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(secondAckId), 0);
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void modifyAckDeadlineExtendsTheLeaseFromNow() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+        clock.advance(Duration.ofSeconds(5));
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 30);
+
+        clock.advance(Duration.ofSeconds(29));
+        service.expireLeases();
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+
+        clock.advance(Duration.ofSeconds(1));
+        service.expireLeases();
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void modifyAckDeadlineCanShortenTheLease() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 60);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 3);
+        clock.advance(Duration.ofSeconds(3));
+        service.expireLeases();
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void modifyAckDeadlineDoesNotReviveAnExpiredLease() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        String ackId = service.pull("projects/p1/subscriptions/s1", 10).get(0).getAckId();
+
+        clock.advance(Duration.ofSeconds(10));
+        service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(ackId), 600);
+        service.expireLeases();
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void changingTheSubscriptionAckDeadlineKeepsTheDeadlineOfMessagesAlreadyPulled() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10);
+
+        service.updateSubscription("projects/p1/subscriptions/s1", 60, null, null, null, null, null,
+                null, null, null, null, null, null, null, List.of("ackDeadlineSeconds"));
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void streamAckDeadlineReplacesTheSubscriptionAckDeadline() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 60);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10, 20);
+
+        clock.advance(Duration.ofSeconds(20));
+        service.expireLeases();
+
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void streamAckDeadlineUnderTenSecondsIsTreatedAsTen() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 60);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10, 5);
+
+        clock.advance(Duration.ofSeconds(9));
+        service.expireLeases();
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+
+        clock.advance(Duration.ofSeconds(1));
+        service.expireLeases();
+        assertEquals(1, service.pull("projects/p1/subscriptions/s1", 10).size());
+    }
+
+    @Test
+    void expiredMessagesAreRedeliveredInPublishOrderAheadOfTheBacklog() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1", List.of(
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m1")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m2")).build(),
+                PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("m3")).build()));
+        service.pull("projects/p1/subscriptions/s1", 2);
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+
+        assertEquals(List.of("m1", "m2", "m3"), service.pull("projects/p1/subscriptions/s1", 10).stream()
+                .map(m -> m.getMessage().getData().toStringUtf8()).toList());
+    }
+
+    @Test
+    void leaseExpiryWakesStreamingListenersOnlyWhenSomethingExpired() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10);
+        AtomicInteger wakeups = new AtomicInteger();
+        Runnable unregister = service.registerMessageListener("projects/p1/subscriptions/s1", wakeups::incrementAndGet);
+
+        service.expireLeases();
+        assertEquals(0, wakeups.get());
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+        assertEquals(1, wakeups.get());
+
+        service.expireLeases();
+        assertEquals(1, wakeups.get());
+        unregister.run();
+    }
+
+    @Test
+    void leaseExpiryAfterDeleteAndRecreateDoesNotLeakIntoTheNewSubscription() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("old")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10);
+        service.deleteSubscription("projects/p1/subscriptions/s1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void leaseExpiryAfterDetachDoesNotResurrectTheMessage() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("msg")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10);
+        service.detachSubscription("projects/p1/subscriptions/s1");
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void modifyAckDeadlineRejectsADeadlineOutsideZeroToSixHundredSeconds() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+
+        GcpException tooLong = assertThrows(GcpException.class,
+                () -> service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of("ack"), 601));
+        assertEquals("INVALID_ARGUMENT", tooLong.getGcpStatus());
+        assertEquals("Invalid ack deadline given (ack_deadline=601). "
+                + "The ack deadline must be between 0 and 600 seconds.", tooLong.getMessage());
+
+        GcpException negative = assertThrows(GcpException.class,
+                () -> service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of("ack"), -1));
+        assertEquals("INVALID_ARGUMENT", negative.getGcpStatus());
+        assertEquals("Invalid ack deadline given (ack_deadline=-1). "
+                + "The ack deadline must be between 0 and 600 seconds.", negative.getMessage());
+    }
+
+    @Test
+    void modifyAckDeadlineRejectsAnEmptyAckIdList() {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+
+        GcpException ex = assertThrows(GcpException.class,
+                () -> service.modifyAckDeadline("projects/p1/subscriptions/s1", List.of(), 10));
+        assertEquals("INVALID_ARGUMENT", ex.getGcpStatus());
+        assertEquals("You have not specified an ack ID in the request.", ex.getMessage());
+    }
+
+    @Test
+    void modifyAckDeadlineOnMissingSubscriptionThrowsNotFound() {
+        GcpException ex = assertThrows(GcpException.class,
+                () -> service.modifyAckDeadline("projects/p1/subscriptions/missing", List.of("ack"), 0));
+        assertEquals("NOT_FOUND", ex.getGcpStatus());
     }
 
     // ── IAM policies ───────────────────────────────────────────────────────────
@@ -1270,6 +1631,108 @@ class PubSubServiceTest {
         List<ReceivedMessage> messages = service.pull("projects/p1/subscriptions/s1", 10);
         assertEquals(1, messages.size());
         assertEquals("at", messages.get(0).getMessage().getData().toStringUtf8());
+    }
+
+    @Test
+    void seekDuringAPullStillDropsTheMessageThePullTookFromTheQueue() throws Exception {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("old")).build()));
+        CountDownLatch pullTookTheMessage = new CountDownLatch(1);
+        CountDownLatch releasePull = new CountDownLatch(1);
+        // pull reads the clock after taking the message from the queue and before leasing it.
+        clock.onNextRead(() -> {
+            pullTookTheMessage.countDown();
+            await(releasePull);
+        });
+        AtomicReference<Thread> seekThread = new AtomicReference<>();
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            try {
+                Future<List<ReceivedMessage>> pull =
+                        executor.submit(() -> service.pull("projects/p1/subscriptions/s1", 10));
+                assertTrue(pullTookTheMessage.await(5, TimeUnit.SECONDS));
+                Future<?> seek = executor.submit(() -> {
+                    seekThread.set(Thread.currentThread());
+                    service.seek("projects/p1/subscriptions/s1", null, secondsFromNow(60));
+                });
+                awaitSeekDoneOrBlocked(seekThread, seek);
+                releasePull.countDown();
+                assertEquals(1, pull.get(5, TimeUnit.SECONDS).size());
+                seek.get(5, TimeUnit.SECONDS);
+            } finally {
+                releasePull.countDown();
+            }
+        }
+
+        clock.advance(Duration.ofSeconds(10));
+        service.expireLeases();
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    @Test
+    void seekWaitsForALeaseExpiryInProgressAndDropsWhatItRequeued() throws Exception {
+        service.createTopic("projects/p1/topics/t1");
+        service.createSubscription("projects/p1/subscriptions/s1", "projects/p1/topics/t1", 10);
+        service.publish("projects/p1/topics/t1",
+                List.of(PubsubMessage.newBuilder().setData(ByteString.copyFromUtf8("old")).build()));
+        service.pull("projects/p1/subscriptions/s1", 10);
+        clock.advance(Duration.ofSeconds(10));
+        CountDownLatch expiryStarted = new CountDownLatch(1);
+        CountDownLatch releaseExpiry = new CountDownLatch(1);
+        clock.onNextRead(() -> {
+            expiryStarted.countDown();
+            await(releaseExpiry);
+        });
+        AtomicReference<Thread> seekThread = new AtomicReference<>();
+
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            try {
+                Future<?> expiry = executor.submit(service::expireLeases);
+                assertTrue(expiryStarted.await(5, TimeUnit.SECONDS));
+                Future<?> seek = executor.submit(() -> {
+                    seekThread.set(Thread.currentThread());
+                    service.seek("projects/p1/subscriptions/s1", null, secondsFromNow(60));
+                });
+                awaitSeekDoneOrBlocked(seekThread, seek);
+                assertFalse(seek.isDone(), "seek ran while the expiry sweep was moving leases");
+                releaseExpiry.countDown();
+                expiry.get(5, TimeUnit.SECONDS);
+                seek.get(5, TimeUnit.SECONDS);
+            } finally {
+                releaseExpiry.countDown();
+            }
+        }
+
+        assertTrue(service.pull("projects/p1/subscriptions/s1", 10).isEmpty());
+    }
+
+    private static void awaitSeekDoneOrBlocked(AtomicReference<Thread> seekThread, Future<?> seek) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (!seek.isDone() && !isBlockedInSeek(seekThread.get())) {
+            assertTrue(System.nanoTime() < deadline, "seek neither finished nor waited for the lease lock");
+            Thread.onSpinWait();
+        }
+    }
+
+    private static boolean isBlockedInSeek(Thread thread) {
+        if (thread == null || thread.getState() != Thread.State.BLOCKED) {
+            return false;
+        }
+        StackTraceElement[] stack = thread.getStackTrace();
+        return stack.length > 0
+                && stack[0].getClassName().equals(PubSubService.class.getName())
+                && stack[0].getMethodName().equals("seek");
+    }
+
+    private static void await(CountDownLatch latch) {
+        try {
+            assertTrue(latch.await(5, TimeUnit.SECONDS));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(e);
+        }
     }
 
     private static Timestamp secondsFromNow(long seconds) {

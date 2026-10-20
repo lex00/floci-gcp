@@ -118,6 +118,27 @@ def test_rsa_oaep_asymmetric_decrypt(kms_client, key_ring, unique_name):
     assert response.plaintext == plaintext
 
 
+def test_mac_sign_and_verify(kms_client, key_ring, unique_name):
+    from google.cloud import kms
+
+    key = _create_key(kms_client, key_ring, f"mac-{unique_name}",
+                      kms.CryptoKey.CryptoKeyPurpose.MAC,
+                      kms.CryptoKeyVersion.CryptoKeyVersionAlgorithm.HMAC_SHA256)
+    version_name = f"{key.name}/cryptoKeyVersions/1"
+    data = b"message-to-authenticate"
+
+    signed = kms_client.mac_sign(request={"name": version_name, "data": data})
+    assert len(signed.mac) == 32
+
+    verified = kms_client.mac_verify(request={"name": version_name, "data": data, "mac": signed.mac})
+    assert verified.success is True
+    assert verified.verified_success_integrity is True
+
+    tampered = kms_client.mac_verify(request={"name": version_name, "data": data + b"!", "mac": signed.mac})
+    assert tampered.success is False
+    assert tampered.verified_success_integrity is False
+
+
 def test_generate_random_bytes(kms_client, project_id):
     from google.cloud import kms
 

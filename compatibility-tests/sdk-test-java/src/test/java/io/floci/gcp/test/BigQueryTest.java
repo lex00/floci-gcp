@@ -1,7 +1,9 @@
 package io.floci.gcp.test;
 
+import com.google.cloud.NoCredentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryException;
+import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.DatasetId;
 import com.google.cloud.bigquery.DatasetInfo;
 import com.google.cloud.bigquery.Field;
@@ -487,6 +489,51 @@ class BigQueryTest {
                 "SELECT table_name, table_type FROM `" + PROJECT_ID + "`.`region-us`.INFORMATION_SCHEMA.TABLES"
                         + " WHERE table_schema = '" + DATASET + "' AND table_name = 'busy'").build());
         assertThat(tables.iterateAll().iterator().next().get("table_type").getStringValue()).isEqualTo("VIEW");
+    }
+
+    @Test
+    @Order(21)
+    void jobLocationMustMatchTheDatasetLocation() throws InterruptedException {
+        String dataset = DATASET + "_eu";
+        bigquery.create(DatasetInfo.newBuilder(dataset).setLocation("EU").build());
+        bigquery.create(TableInfo.of(TableId.of(dataset, "items"),
+                StandardTableDefinition.of(Schema.of(Field.of("name", StandardSQLTypeName.STRING)))));
+        bigquery.insertAll(InsertAllRequest.newBuilder(TableId.of(dataset, "items"))
+                .addRow(Map.of("name", "widget")).build());
+        String sql = "SELECT name FROM `" + PROJECT_ID + "." + dataset + ".items`";
+
+        BigQuery euClient = bigquery.getOptions().toBuilder().setLocation("EU").build().getService();
+        Job job = euClient.create(JobInfo.of(QueryJobConfiguration.newBuilder(sql).build())).waitFor();
+        assertThat(job.getStatus().getError()).isNull();
+        assertThat(job.getJobId().getLocation()).isEqualTo("EU");
+        assertThat(job.getQueryResults().getTotalRows()).isEqualTo(1);
+
+        // With no location of its own, the client gets the job run where the dataset lives.
+        BigQuery anyLocation = BigQueryOptions.newBuilder()
+                .setHost(bigquery.getOptions().getHost())
+                .setProjectId(PROJECT_ID)
+                .setCredentials(NoCredentials.getInstance())
+                .build()
+                .getService();
+        Job inferred = anyLocation.create(JobInfo.of(QueryJobConfiguration.newBuilder(sql).build())).waitFor();
+        assertThat(inferred.getStatus().getError()).isNull();
+        assertThat(inferred.getJobId().getLocation()).isEqualTo("EU");
+        assertThat(inferred.getQueryResults().getTotalRows()).isEqualTo(1);
+
+        String jobId = job.getJobId().getJob();
+        assertThat(bigquery.getJob(JobId.newBuilder().setJob(jobId).setLocation("EU").build())).isNotNull();
+        assertThat(bigquery.getJob(JobId.newBuilder().setJob(jobId).setLocation("US").build())).isNull();
+
+        // The shared client runs jobs in US, so the EU dataset is not found there.
+        assertThatThrownBy(() -> bigquery.query(QueryJobConfiguration.newBuilder(sql).build()))
+                .isInstanceOfSatisfying(BigQueryException.class, e -> {
+                    assertThat(e.getCode()).isEqualTo(404);
+                    assertThat(e.getMessage()).contains("was not found in location US");
+                });
+
+        assertThat(euClient.delete(JobId.newBuilder().setJob(jobId).setLocation("EU").build())).isTrue();
+        assertThat(bigquery.delete(DatasetId.of(PROJECT_ID, dataset),
+                BigQuery.DatasetDeleteOption.deleteContents())).isTrue();
     }
 
     @Test

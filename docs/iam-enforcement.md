@@ -6,10 +6,12 @@ and gRPC transport adapters. The gRPC interceptor is installed in
 The global-interceptor annotation also covers Quarkus-managed registrations.
 An annotation alone does not cover the dynamically bound controllers.
 
-Resource Manager projects and GCS bucket/object operations are currently integrated. GCS invokes
-the shared evaluator from its service-level authorization path so JSON filtering
-does not bypass its lock-sensitive lifecycle coordination. Pub/Sub and Secret
-Manager IAM enforcement is not supported.
+Resource Manager projects, Cloud Run v2 services and revisions, Secret Manager
+secrets and versions, Pub/Sub, and GCS bucket/object operations are integrated. Cloud Run
+service-policy methods use REST and the shared IAM gRPC API. Secret Manager secret
+policy methods work over REST and gRPC. GCS invokes the shared evaluator from its
+service-level authorization path so JSON filtering does not bypass its
+lock-sensitive lifecycle coordination.
 
 ## Service extension contract
 
@@ -21,6 +23,8 @@ Manager IAM enforcement is not supported.
 3. Translate each REST handler and protobuf request to an `IamOperation`. Both
    transports must use the same `checks` table. An unfamiliar operation must throw
    `unsupported(...)`. Explicit permission-free methods may return an empty list.
+   gRPC services override `grpcOperation(String, Message)` and read request fields
+   through typed protobuf getters. The default rejects unmapped gRPC operations.
 4. Return every required `IamPermissionCheck`, including checks on other resources.
    Create/list operations usually check the parent; verify the exact upstream
    contract. Do not guess permissions from method names. Each check is conjunctive.
@@ -47,7 +51,9 @@ The current REST transport adapter buffers and restores JSON request bodies. It
 is not an XML, multipart, raw-media, or HTTP/protobuf authorization parser. Add an
 appropriate transport adapter for those formats while retaining the shared decision
 point. Likewise, streams that address resources after their initial message need
-explicit state handling and tests. The authorization interceptor does not support StreamingPull.
+explicit state handling and tests. Pub/Sub StreamingPull retains the first
+subscription name, checks every message and delivery, and rejects a repeated
+subscription field in later messages.
 GCS intentionally does not register its REST controllers with that filter. Its
 authorization service calls the same evaluator after applying GCS-specific
 credential handling. XML, media, upload, and service-layer paths use that entry
@@ -91,10 +97,13 @@ policy lock in the same global order before entering the storage mutation lock. 
 shared REST filter and gRPC interceptor do not hold a lock
 across authorization and the subsequent service mutation. Other service integrations
 must use the service-level ordered-lock entry point when that consistency is required.
+Secret Manager holds the secret lock before the ordered project and secret policy
+locks across authorization and the secret or version operation.
 
 ## Upstream evidence
 
-The v1 protocol and role contracts are defined by these upstream references:
+The Resource Manager v1, Cloud Run v2, and Secret Manager v1 protocol and role
+contracts are defined by these upstream references:
 
 - [Resource Manager v1 project get](https://docs.cloud.google.com/resource-manager/reference/rest/v1/projects/get)
   [project policy constraints](https://docs.cloud.google.com/resource-manager/reference/rest/v1/projects/setIamPolicy),
@@ -102,8 +111,18 @@ The v1 protocol and role contracts are defined by these upstream references:
 - [IAM resource attributes](https://docs.cloud.google.com/iam/docs/conditions-resource-attributes),
   [expression protobuf](https://github.com/googleapis/googleapis/blob/master/google/type/expr.proto), and
   [Google API errors](https://google.aip.dev/193).
+- [Cloud Run role permissions](https://docs.cloud.google.com/iam/docs/roles-permissions/run)
+  and [Cloud Run service IAM methods](https://docs.cloud.google.com/run/docs/reference/rest/v2/projects.locations.services).
+- [Cloud Run v2 service proto](https://github.com/googleapis/googleapis/blob/master/google/cloud/run/v2/service.proto),
+  [revision proto](https://github.com/googleapis/googleapis/blob/master/google/cloud/run/v2/revision.proto),
+  and [REST discovery document](https://run.googleapis.com/$discovery/rest?version=v2).
+- [Secret Manager v1 service proto](https://github.com/googleapis/googleapis/blob/master/google/cloud/secretmanager/v1/service.proto)
+  and [Secret Manager access control](https://docs.cloud.google.com/secret-manager/docs/access-control).
 
 The REST client implementation is in the [Resource Manager v1 Java SDK source](https://github.com/googleapis/google-api-java-client-services/blob/main/clients/google-api-services-cloudresourcemanager/v1/2.0.0/com/google/api/services/cloudresourcemanager/CloudResourceManager.java).
+The Cloud Run client HTTP JSON mappings are in the
+[Java service stub](https://github.com/googleapis/google-cloud-java/blob/main/java-run/google-cloud-run/src/main/java/com/google/cloud/run/v2/stub/HttpJsonServicesStub.java)
+and [revision stub](https://github.com/googleapis/google-cloud-java/blob/main/java-run/google-cloud-run/src/main/java/com/google/cloud/run/v2/stub/HttpJsonRevisionsStub.java).
 The shared policy transport uses the [IAM v1 policy proto](https://github.com/googleapis/googleapis/blob/master/google/iam/v1/iam_policy.proto).
 
 Denial codes and permission requirements follow these contracts. Exact production

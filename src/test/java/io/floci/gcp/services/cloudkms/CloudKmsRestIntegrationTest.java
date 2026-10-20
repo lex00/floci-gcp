@@ -302,4 +302,63 @@ class CloudKmsRestIntegrationTest {
                 .then().statusCode(400)
                 .body("error.status", equalTo("INVALID_ARGUMENT"));
     }
+
+    @Test
+    void macSignAndMacVerifyOverRest() {
+        String version = createKey("mac", "MAC", "HMAC_SHA256") + "/cryptoKeyVersions/1";
+        String name = version.substring("/v1/".length());
+        byte[] data = "payload".getBytes(StandardCharsets.UTF_8);
+
+        String mac = json()
+                .body("{\"data\": \"" + b64(data) + "\", \"dataCrc32c\": \"" + crc32c(data) + "\"}")
+                .when().post(version + ":macSign")
+                .then().statusCode(200)
+                .body("name", equalTo(name))
+                .body("verifiedDataCrc32c", equalTo(true))
+                .body("protectionLevel", equalTo("SOFTWARE"))
+                .extract().path("mac");
+        byte[] macBytes = Base64.getDecoder().decode(mac);
+        json().body("{\"data\": \"" + b64(data) + "\"}")
+                .when().post(version + ":macSign")
+                .then().statusCode(200)
+                .body("mac", equalTo(mac))
+                .body("macCrc32c", equalTo(crc32c(macBytes)))
+                .body("verifiedDataCrc32c", nullValue());
+
+        json().body("{\"data\": \"" + b64(data) + "\", \"mac\": \"" + mac + "\","
+                        + " \"macCrc32c\": \"" + crc32c(macBytes) + "\"}")
+                .when().post(version + ":macVerify")
+                .then().statusCode(200)
+                .body("name", equalTo(name))
+                .body("success", equalTo(true))
+                .body("verifiedSuccessIntegrity", equalTo(true))
+                .body("verifiedMacCrc32c", equalTo(true))
+                .body("protectionLevel", equalTo("SOFTWARE"));
+
+        // proto3 JSON leaves false bools out, so a failed check carries no success field.
+        json().body("{\"data\": \"" + b64("other".getBytes(StandardCharsets.UTF_8)) + "\", \"mac\": \"" + mac + "\"}")
+                .when().post(version + ":macVerify")
+                .then().statusCode(200)
+                .body("success", nullValue())
+                .body("verifiedSuccessIntegrity", nullValue());
+
+        json().body("{\"data\": \"" + b64(data) + "\", \"dataCrc32c\": \"1\"}")
+                .when().post(version + ":macSign")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+        json().body("{\"data\": \"" + b64(data) + "\", \"mac\": \"" + mac + "\", \"macCrc32c\": \"1\"}")
+                .when().post(version + ":macVerify")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
+
+    @Test
+    void macSignOnANonMacKeyIsInvalidArgument() {
+        String version = createKey("not-mac", "ENCRYPT_DECRYPT", null) + "/cryptoKeyVersions/1";
+
+        json().body("{\"data\": \"" + b64(new byte[] {1}) + "\"}")
+                .when().post(version + ":macSign")
+                .then().statusCode(400)
+                .body("error.status", equalTo("INVALID_ARGUMENT"));
+    }
 }

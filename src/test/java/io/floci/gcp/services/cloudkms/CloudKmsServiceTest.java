@@ -12,9 +12,13 @@ import java.security.KeyFactory;
 import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
 import java.util.Base64;
+import java.util.Map;
 
 import javax.crypto.Cipher;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -186,6 +190,82 @@ class CloudKmsServiceTest {
         GcpException ex = assertThrows(GcpException.class,
                 () -> service.getPublicKeyVersion(key.getName() + "/cryptoKeyVersions/1"));
         assertEquals("INVALID_ARGUMENT", ex.getGcpStatus());
+    }
+
+    @Test
+    void macSignMatchesAnHmacOverTheVersionKeyForEveryAlgorithm() throws Exception {
+        service.createKeyRing(LOCATION, "kr");
+        Map<String, String> jcaNames = Map.of("HMAC_SHA256", "HmacSHA256", "HMAC_SHA1", "HmacSHA1",
+                "HMAC_SHA384", "HmacSHA384", "HMAC_SHA512", "HmacSHA512", "HMAC_SHA224", "HmacSHA224");
+        Map<String, Integer> keyBytes = Map.of("HMAC_SHA256", 32, "HMAC_SHA1", 20,
+                "HMAC_SHA384", 48, "HMAC_SHA512", 64, "HMAC_SHA224", 28);
+        byte[] data = "message-to-mac".getBytes(StandardCharsets.UTF_8);
+        for (String algorithm : jcaNames.keySet()) {
+            StoredCryptoKey key = service.createCryptoKey(LOCATION + "/keyRings/kr", algorithm.toLowerCase(),
+                    "MAC", algorithm, false);
+            String versionName = key.getName() + "/cryptoKeyVersions/1";
+            byte[] material = Base64.getDecoder().decode(service.getCryptoKeyVersion(versionName).getKeyMaterialBase64());
+
+            Mac expected = Mac.getInstance(jcaNames.get(algorithm));
+            expected.init(new SecretKeySpec(material, jcaNames.get(algorithm)));
+
+            assertEquals(keyBytes.get(algorithm), material.length, algorithm);
+            assertArrayEquals(expected.doFinal(data), service.macSign(versionName, data), algorithm);
+            assertNull(key.getPrimaryVersion(), algorithm);
+        }
+    }
+
+    @Test
+    void macVerifyAcceptsOnlyTheMacOfTheSameDataAndVersion() {
+        service.createKeyRing(LOCATION, "kr");
+        StoredCryptoKey key = service.createCryptoKey(LOCATION + "/keyRings/kr", "mac", "MAC", "HMAC_SHA256", false);
+        String v1 = key.getName() + "/cryptoKeyVersions/1";
+        String v2 = service.createCryptoKeyVersion(key.getName()).getName();
+        byte[] data = "payload".getBytes(StandardCharsets.UTF_8);
+        byte[] mac = service.macSign(v1, data);
+
+        assertTrue(service.macVerify(v1, data, mac));
+        assertFalse(service.macVerify(v1, "payload!".getBytes(StandardCharsets.UTF_8), mac));
+        assertFalse(service.macVerify(v2, data, mac));
+        assertFalse(service.macVerify(v1, data, Arrays.copyOf(mac, mac.length - 1)));
+        assertFalse(service.macVerify(v1, data, new byte[0]));
+    }
+
+    @Test
+    void macKeysNeedAnHmacAlgorithmAndOnlyMacKeysMac() {
+        String symmetricVersion = symmetricKey("sym").getName() + "/cryptoKeyVersions/1";
+        String ring = LOCATION + "/keyRings/kr";
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.createCryptoKey(ring, "no-alg", "MAC", null, false)).getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.createCryptoKey(ring, "wrong-alg", "MAC", "EC_SIGN_P256_SHA256", false)).getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.createCryptoKey(ring, "sign-hmac", "ASYMMETRIC_SIGN", "HMAC_SHA256", false)).getGcpStatus());
+
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.macSign(symmetricVersion, new byte[] {1})).getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.macVerify(symmetricVersion, new byte[] {1}, new byte[32])).getGcpStatus());
+
+        String macKey = service.createCryptoKey(ring, "mac", "MAC", "HMAC_SHA256", false).getName();
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.encrypt(macKey + "/cryptoKeyVersions/1", new byte[] {1}, null)).getGcpStatus());
+        assertEquals("INVALID_ARGUMENT", assertThrows(GcpException.class,
+                () -> service.getPublicKeyVersion(macKey + "/cryptoKeyVersions/1")).getGcpStatus());
+    }
+
+    @Test
+    void macOperationsNeedAnEnabledVersion() {
+        service.createKeyRing(LOCATION, "kr");
+        StoredCryptoKey key = service.createCryptoKey(LOCATION + "/keyRings/kr", "mac", "MAC", "HMAC_SHA256", false);
+        String versionName = key.getName() + "/cryptoKeyVersions/1";
+        byte[] mac = service.macSign(versionName, new byte[] {1});
+        service.updateCryptoKeyVersionState(versionName, "DISABLED");
+
+        assertEquals("FAILED_PRECONDITION", assertThrows(GcpException.class,
+                () -> service.macSign(versionName, new byte[] {1})).getGcpStatus());
+        assertEquals("FAILED_PRECONDITION", assertThrows(GcpException.class,
+                () -> service.macVerify(versionName, new byte[] {1}, mac)).getGcpStatus());
     }
 
     private static PublicKey publicKeyFrom(StoredCryptoKeyVersion version, String algorithm) throws Exception {

@@ -20,7 +20,7 @@ floci-gcp is a fast, free, and open-source local GCP emulator built for develope
 | **Datastore** | gRPC + HTTP/protobuf | Entity operations and structured queries over both transports; GQL queries and COUNT aggregation over HTTP/protobuf; transaction RPCs with limited semantics |
 | **Secret Manager** | gRPC + REST | Secrets, versions, access, disable/enable/destroy, IAM bindings |
 | **Cloud Logging** | gRPC + REST | Structured log ingestion (`WriteLogEntries`), read-back (`ListLogEntries`) with filter subset, `ListLogs`, `DeleteLog` |
-| **Cloud KMS** | gRPC + REST | Key rings, crypto keys, versions, symmetric encrypt/decrypt, asymmetric sign/decrypt, `GenerateRandomBytes` |
+| **Cloud KMS** | gRPC + REST | Key rings, crypto keys, versions, symmetric encrypt/decrypt, asymmetric sign/decrypt, HMAC MAC sign/verify, `GenerateRandomBytes` |
 | **IAM** | REST | Service accounts, RSA-2048 keys, policy bindings, SignBlob (V4 signed URLs) |
 | **Security Token Service (STS)** | REST | OAuth 2.0 token exchange for GCS Credential Access Boundaries |
 | **Managed Kafka** | REST | Clusters, topics, consumer groups (Redpanda-backed or mock mode) |
@@ -35,8 +35,9 @@ floci-gcp is a fast, free, and open-source local GCP emulator built for develope
 | **Service Usage** | REST | Enable/disable/list project services; backs Terraform `google_project_service` |
 | **Firebase Auth (Identity Platform)** | REST | Identity Toolkit v1 sign-up/sign-in, emulator JWTs, admin user CRUD |
 | **Eventarc** | REST | Trigger CRUD; delivers CloudEvents from Pub/Sub and GCS events to Cloud Run and HTTP endpoints |
-| **IAM Credentials** | REST | `generateAccessToken` for service-account impersonation (shape-only stub tokens) |
-| **Resource Manager** | REST | `projects.get` and project IAM policy mixins for provider project lookups |
+| **IAM Credentials** | REST | `generateAccessToken` for service-account impersonation (shape-only stub tokens), `signBlob`, `signJwt` |
+| **Resource Manager** | REST | v1 projects: create, get by ID or number, list with filter, update, delete/undelete, ancestry, IAM policy mixins; optional strict project mode |
+| **Cloud Billing** | REST | Project billing info stub for Terraform `google_project` billing links |
 
 ## Why floci-gcp?
 

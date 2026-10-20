@@ -30,6 +30,10 @@ import com.google.cloud.kms.v1.ListCryptoKeysRequest;
 import com.google.cloud.kms.v1.ListCryptoKeysResponse;
 import com.google.cloud.kms.v1.ListKeyRingsRequest;
 import com.google.cloud.kms.v1.ListKeyRingsResponse;
+import com.google.cloud.kms.v1.MacSignRequest;
+import com.google.cloud.kms.v1.MacSignResponse;
+import com.google.cloud.kms.v1.MacVerifyRequest;
+import com.google.cloud.kms.v1.MacVerifyResponse;
 import com.google.cloud.kms.v1.ProtectionLevel;
 import com.google.cloud.kms.v1.PublicKey;
 import com.google.cloud.kms.v1.RestoreCryptoKeyVersionRequest;
@@ -343,6 +347,48 @@ public class CloudKmsController extends KeyManagementServiceGrpc.KeyManagementSe
                     .setVerifiedDigestCrc32C(verifiedDigest)
                     .setVerifiedDataCrc32C(verifiedData)
                     .setName(request.getName())
+                    .setProtectionLevel(ProtectionLevel.SOFTWARE)
+                    .build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
+    }
+
+    @Override
+    public void macSign(MacSignRequest request, StreamObserver<MacSignResponse> responseObserver) {
+        try {
+            byte[] data = request.getData().toByteArray();
+            boolean verifiedData = verifyCrc32c(request.hasDataCrc32C(), request.getDataCrc32C().getValue(), data);
+            byte[] mac = service.macSign(request.getName(), data);
+            responseObserver.onNext(MacSignResponse.newBuilder()
+                    .setName(request.getName())
+                    .setMac(ByteString.copyFrom(mac))
+                    .setMacCrc32C(Int64Value.of(crc32c(mac)))
+                    .setVerifiedDataCrc32C(verifiedData)
+                    .setProtectionLevel(ProtectionLevel.SOFTWARE)
+                    .build());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
+    }
+
+    @Override
+    public void macVerify(MacVerifyRequest request, StreamObserver<MacVerifyResponse> responseObserver) {
+        try {
+            byte[] data = request.getData().toByteArray();
+            byte[] mac = request.getMac().toByteArray();
+            boolean verifiedData = verifyCrc32c(request.hasDataCrc32C(), request.getDataCrc32C().getValue(), data);
+            boolean verifiedMac = verifyCrc32c(request.hasMacCrc32C(), request.getMacCrc32C().getValue(), mac);
+            boolean success = service.macVerify(request.getName(), data, mac);
+            responseObserver.onNext(MacVerifyResponse.newBuilder()
+                    .setName(request.getName())
+                    .setSuccess(success)
+                    .setVerifiedDataCrc32C(verifiedData)
+                    .setVerifiedMacCrc32C(verifiedMac)
+                    // Repeats success so a client can detect a corrupted success field.
+                    .setVerifiedSuccessIntegrity(success)
                     .setProtectionLevel(ProtectionLevel.SOFTWARE)
                     .build());
             responseObserver.onCompleted();

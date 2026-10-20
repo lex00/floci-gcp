@@ -3,18 +3,49 @@ package io.floci.gcp.services.pubsub;
 import com.google.protobuf.Empty;
 import com.google.protobuf.FieldMask;
 import com.google.protobuf.Timestamp;
-import com.google.pubsub.v1.*;
+import com.google.pubsub.v1.AcknowledgeRequest;
+import com.google.pubsub.v1.CreateSnapshotRequest;
+import com.google.pubsub.v1.DeadLetterPolicy;
+import com.google.pubsub.v1.DeleteSnapshotRequest;
+import com.google.pubsub.v1.DeleteSubscriptionRequest;
+import com.google.pubsub.v1.GetSnapshotRequest;
+import com.google.pubsub.v1.GetSubscriptionRequest;
+import com.google.pubsub.v1.ListSnapshotsRequest;
+import com.google.pubsub.v1.ListSnapshotsResponse;
+import com.google.pubsub.v1.ListSubscriptionsRequest;
+import com.google.pubsub.v1.ListSubscriptionsResponse;
+import com.google.pubsub.v1.ModifyAckDeadlineRequest;
+import com.google.pubsub.v1.ModifyPushConfigRequest;
+import com.google.pubsub.v1.PullRequest;
+import com.google.pubsub.v1.PullResponse;
+import com.google.pubsub.v1.PushConfig;
+import com.google.pubsub.v1.ReceivedMessage;
+import com.google.pubsub.v1.SeekRequest;
+import com.google.pubsub.v1.SeekResponse;
+import com.google.pubsub.v1.Snapshot;
+import com.google.pubsub.v1.StreamingPullRequest;
+import com.google.pubsub.v1.StreamingPullResponse;
+import com.google.pubsub.v1.SubscriberGrpc;
+import com.google.pubsub.v1.Subscription;
+import com.google.pubsub.v1.UpdateSnapshotRequest;
+import com.google.pubsub.v1.UpdateSubscriptionRequest;
+import io.floci.gcp.core.common.GcpException;
 import io.floci.gcp.core.common.GcpGrpcController;
+import io.floci.gcp.core.common.GcpResourceNames;
 import io.floci.gcp.core.common.PageToken;
+import io.floci.gcp.services.iam.authorization.IamGrpcDeliveryAuthorization;
 import io.floci.gcp.services.pubsub.model.StoredSnapshot;
 import io.floci.gcp.services.pubsub.model.StoredSubscription;
 import io.grpc.stub.StreamObserver;
 import org.jboss.logging.Logger;
 
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBase {
@@ -62,7 +93,7 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
             StreamObserver<ListSubscriptionsResponse> responseObserver) {
         LOG.debugf("listSubscriptions project=%s", request.getProject());
         try {
-            String project = extractProjectId(request.getProject());
+            String project = GcpResourceNames.projectIdOf(request.getProject());
             List<StoredSubscription> all = service.listSubscriptions(project);
             PageToken.Page<StoredSubscription> page = PageToken.paginate(all,
                     request.getPageSize(), request.getPageToken());
@@ -153,15 +184,25 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
     public void modifyAckDeadline(ModifyAckDeadlineRequest request, StreamObserver<Empty> responseObserver) {
         LOG.debugf("modifyAckDeadline subscription=%s ackIds=%d deadline=%d",
                 request.getSubscription(), request.getAckIdsCount(), request.getAckDeadlineSeconds());
-        responseObserver.onNext(Empty.getDefaultInstance());
-        responseObserver.onCompleted();
+        try {
+            service.modifyAckDeadline(request.getSubscription(), request.getAckIdsList(),
+                    request.getAckDeadlineSeconds());
+            responseObserver.onNext(Empty.getDefaultInstance());
+            responseObserver.onCompleted();
+        } catch (Exception e) {
+            LOG.warnf("modifyAckDeadline failed: %s", e.getMessage());
+            GcpGrpcController.grpcError(responseObserver, e);
+        }
     }
 
     @Override
     public StreamObserver<StreamingPullRequest> streamingPull(
             StreamObserver<StreamingPullResponse> responseObserver) {
         AtomicReference<String> subscriptionRef = new AtomicReference<>();
+        AtomicInteger streamAckDeadlineSeconds = new AtomicInteger();
         AtomicReference<Runnable> unregisterRef = new AtomicReference<>();
+        AtomicReference<IamGrpcDeliveryAuthorization.Delivery> deliveryAuthorizationRef =
+                new AtomicReference<>();
         AtomicBoolean closed = new AtomicBoolean(false);
         Object deliveryLock = new Object();
 
@@ -169,14 +210,20 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
             @Override
             public void onNext(StreamingPullRequest request) {
                 try {
+                    if (request.getStreamAckDeadlineSeconds() > 0) {
+                        streamAckDeadlineSeconds.set(request.getStreamAckDeadlineSeconds());
+                    }
                     if (!request.getSubscription().isEmpty()) {
                         String sub = request.getSubscription();
                         subscriptionRef.set(sub);
+                        deliveryAuthorizationRef.set(IamGrpcDeliveryAuthorization.current());
                         Runnable previous = unregisterRef.getAndSet(
                                 service.registerMessageListener(
                                         sub,
                                         () -> deliverStreamingMessages(
-                                                sub, responseObserver, closed, deliveryLock)));
+                                                sub, responseObserver, unregisterRef, closed, deliveryLock,
+                                                deliveryAuthorizationRef.get(), StreamingPullRequest.getDefaultInstance(),
+                                                streamAckDeadlineSeconds.get())));
                         if (previous != null) {
                             previous.run();
                         }
@@ -186,11 +233,8 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
                     if (sub == null) {
                         return;
                     }
-                    if (!request.getAckIdsList().isEmpty()) {
-                        LOG.debugf("streamingPull ack subscription=%s ackIds=%d", sub, request.getAckIdsCount());
-                        service.acknowledge(sub, request.getAckIdsList());
-                    }
-                    deliverStreamingMessages(sub, responseObserver, closed, deliveryLock);
+                    deliverStreamingMessages(sub, responseObserver, unregisterRef, closed, deliveryLock,
+                            deliveryAuthorizationRef.get(), request, streamAckDeadlineSeconds.get());
                 } catch (Exception e) {
                     LOG.warnf("streamingPull error: %s", e.getMessage());
                     failStreamingPull(responseObserver, unregisterRef, closed, deliveryLock, e);
@@ -211,21 +255,66 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
         };
     }
 
+    private void modifyStreamingAckDeadlines(String sub, StreamingPullRequest request, AtomicBoolean requeued) {
+        if (request.getModifyDeadlineAckIdsCount() != request.getModifyDeadlineSecondsCount()) {
+            throw GcpException.invalidArgument("modify_deadline_ack_ids has " + request.getModifyDeadlineAckIdsCount()
+                    + " entries but modify_deadline_seconds has " + request.getModifyDeadlineSecondsCount()
+                    + "; the two lists must have the same size.");
+        }
+        LOG.debugf("streamingPull modifyAckDeadline subscription=%s ackIds=%d",
+                sub, request.getModifyDeadlineAckIdsCount());
+        Map<Integer, List<String>> ackIdsByDeadline = new LinkedHashMap<>();
+        for (int i = 0; i < request.getModifyDeadlineAckIdsCount(); i++) {
+            ackIdsByDeadline.computeIfAbsent(request.getModifyDeadlineSeconds(i), k -> new ArrayList<>())
+                    .add(request.getModifyDeadlineAckIds(i));
+        }
+        for (Map.Entry<Integer, List<String>> entry : ackIdsByDeadline.entrySet()) {
+            if (service.modifyAckDeadlineWithoutNotification(sub, entry.getValue(), entry.getKey())) {
+                requeued.set(true);
+            }
+        }
+    }
+
     private void deliverStreamingMessages(String sub,
             StreamObserver<StreamingPullResponse> responseObserver,
+            AtomicReference<Runnable> unregisterRef,
             AtomicBoolean closed,
-            Object deliveryLock) {
-        synchronized (deliveryLock) {
-            if (closed.get()) {
-                return;
+            Object deliveryLock,
+            IamGrpcDeliveryAuthorization.Delivery deliveryAuthorization,
+            StreamingPullRequest request,
+            int streamAckDeadlineSeconds) {
+        AtomicBoolean requeued = new AtomicBoolean(false);
+        try {
+            Runnable delivery = () -> {
+                synchronized (deliveryLock) {
+                    if (closed.get()) {
+                        return;
+                    }
+                    if (!request.getAckIdsList().isEmpty()) {
+                        LOG.debugf("streamingPull ack subscription=%s ackIds=%d", sub, request.getAckIdsCount());
+                        service.acknowledge(sub, request.getAckIdsList());
+                    }
+                    if (request.getModifyDeadlineAckIdsCount() > 0 || request.getModifyDeadlineSecondsCount() > 0) {
+                        modifyStreamingAckDeadlines(sub, request, requeued);
+                    }
+                    List<ReceivedMessage> messages = service.pull(sub, 1000, streamAckDeadlineSeconds);
+                    if (!messages.isEmpty()) {
+                        LOG.debugf("streamingPull deliver subscription=%s messages=%d", sub, messages.size());
+                        responseObserver.onNext(StreamingPullResponse.newBuilder()
+                                .addAllReceivedMessages(messages).build());
+                    }
+                }
+            };
+            if (deliveryAuthorization == null) {
+                delivery.run();
+            } else {
+                deliveryAuthorization.run(sub, delivery);
             }
-            List<ReceivedMessage> messages = service.pull(sub, 1000);
-            if (!messages.isEmpty()) {
-                LOG.debugf("streamingPull deliver subscription=%s messages=%d", sub, messages.size());
-                responseObserver.onNext(
-                        StreamingPullResponse.newBuilder()
-                                .addAllReceivedMessages(messages)
-                                .build());
+        } catch (Exception e) {
+            failStreamingPull(responseObserver, unregisterRef, closed, deliveryLock, e);
+        } finally {
+            if (requeued.get()) {
+                service.notifyListeners(sub);
             }
         }
     }
@@ -297,7 +386,7 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
     public void listSnapshots(ListSnapshotsRequest request, StreamObserver<ListSnapshotsResponse> responseObserver) {
         LOG.debugf("listSnapshots project=%s", request.getProject());
         try {
-            String project = extractProjectId(request.getProject());
+            String project = GcpResourceNames.projectIdOf(request.getProject());
             List<StoredSnapshot> all = service.listSnapshots(project);
             PageToken.Page<StoredSnapshot> page = PageToken.paginate(all,
                     request.getPageSize(), request.getPageToken());
@@ -420,10 +509,4 @@ public class PubSubSubscriberController extends SubscriberGrpc.SubscriberImplBas
         return builder.build();
     }
 
-    private static String extractProjectId(String parent) {
-        if (parent.startsWith("projects/")) {
-            return parent.substring("projects/".length());
-        }
-        return parent;
-    }
 }

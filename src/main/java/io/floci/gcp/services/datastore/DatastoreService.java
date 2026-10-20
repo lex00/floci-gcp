@@ -1,6 +1,7 @@
 package io.floci.gcp.services.datastore;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.google.datastore.v1.AggregationQuery;
 import com.google.datastore.v1.CompositeFilter;
 import com.google.datastore.v1.Entity;
 import com.google.datastore.v1.Filter;
@@ -11,6 +12,7 @@ import com.google.datastore.v1.PartitionId;
 import com.google.datastore.v1.PropertyFilter;
 import com.google.datastore.v1.Query;
 import com.google.datastore.v1.Value;
+import com.google.protobuf.NullValue;
 import com.google.protobuf.Timestamp;
 import io.floci.gcp.config.EmulatorConfig;
 import io.floci.gcp.core.common.GcpException;
@@ -28,6 +30,7 @@ import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.math.BigInteger;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -72,6 +75,8 @@ public class DatastoreService {
                 .storageKey("datastore")
                 .protocol(ServiceProtocol.GRPC)
                 .resourceClasses(DatastoreController.class)
+                .api("datastore.googleapis.com", "Cloud Datastore API", DatastoreHttpController.class)
+                .usageAdapter(new DatastoreServiceUsageAdapter())
                 .build());
         grpcServerManager.bind(new DatastoreController(this));
     }
@@ -219,6 +224,106 @@ public class DatastoreService {
         }
 
         return candidates;
+    }
+
+    // ── RunAggregationQuery ────────────────────────────────────────────────────
+
+    /**
+     * Evaluates each aggregation over the entities the nested query returns, following the rules on
+     * {@code AggregationQuery.Aggregation} in google/datastore/v1/query.proto.
+     */
+    public Map<String, Value> runAggregationQuery(String projectId, PartitionId partitionId,
+            AggregationQuery query) {
+        List<StoredEntity> entities = runQuery(projectId, partitionId,
+                query.hasNestedQuery() ? query.getNestedQuery() : Query.getDefaultInstance());
+        Map<String, Value> results = new LinkedHashMap<>();
+        int unnamed = 0;
+        for (AggregationQuery.Aggregation aggregation : query.getAggregationsList()) {
+            String alias = aggregation.getAlias().isEmpty() ? "property_" + ++unnamed : aggregation.getAlias();
+            results.put(alias, switch (aggregation.getOperatorCase()) {
+                case COUNT -> count(entities.size(), aggregation.getCount());
+                case SUM -> sum(numericValues(entities, aggregation.getSum().getProperty().getName()));
+                case AVG -> avg(numericValues(entities, aggregation.getAvg().getProperty().getName()));
+                case OPERATOR_NOT_SET -> throw GcpException.invalidArgument("Aggregation operator is required");
+            });
+        }
+        return results;
+    }
+
+    /** A zero up_to counts nothing; only a negative one is rejected. */
+    private static Value count(long count, AggregationQuery.Aggregation.Count spec) {
+        if (spec.hasUpTo()) {
+            long upTo = spec.getUpTo().getValue();
+            if (upTo < 0) {
+                throw GcpException.invalidArgument("count up_to must be non-negative");
+            }
+            count = Math.min(count, upTo);
+        }
+        return Value.newBuilder().setIntegerValue(count).build();
+    }
+
+    /** Only integer and double values are aggregated; every other type, including null, is skipped. */
+    private static List<StoredProperty> numericValues(List<StoredEntity> entities, String property) {
+        return entities.stream()
+                .map(entity -> resolveProperty(entity.getProperties(), property))
+                .filter(v -> v != null && ("integer".equals(v.getType()) && v.getIntegerValue() != null
+                        || "double".equals(v.getType()) && v.getDoubleValue() != null))
+                .toList();
+    }
+
+    /**
+     * The property with this exact name, else the dot-delimited path walked through embedded
+     * entities, as a {@code PropertyReference} name allows.
+     */
+    private static StoredProperty resolveProperty(Map<String, StoredProperty> properties, String name) {
+        if (properties == null) {
+            return null;
+        }
+        StoredProperty exact = properties.get(name);
+        int dot = name.indexOf('.');
+        if (exact != null || dot < 0) {
+            return exact;
+        }
+        StoredProperty parent = properties.get(name.substring(0, dot));
+        if (parent == null || !"entity".equals(parent.getType())) {
+            return null;
+        }
+        return resolveProperty(parent.getEntityProperties(), name.substring(dot + 1));
+    }
+
+    /**
+     * An integer when every value is an integer and the final total fits in 64 bits, otherwise a
+     * double. The integers are added exactly, so an intermediate overflow that later cancels out
+     * still yields an integer.
+     */
+    private static Value sum(List<StoredProperty> values) {
+        BigInteger integerSum = BigInteger.ZERO;
+        double doubleSum = 0;
+        boolean anyDouble = false;
+        for (StoredProperty v : values) {
+            if ("integer".equals(v.getType())) {
+                integerSum = integerSum.add(BigInteger.valueOf(v.getIntegerValue()));
+            } else {
+                anyDouble = true;
+                doubleSum += v.getDoubleValue();
+            }
+        }
+        if (!anyDouble && integerSum.bitLength() < Long.SIZE) {
+            return Value.newBuilder().setIntegerValue(integerSum.longValue()).build();
+        }
+        return Value.newBuilder().setDoubleValue(integerSum.doubleValue() + doubleSum).build();
+    }
+
+    /** Always a double, and null when there is nothing to average. */
+    private static Value avg(List<StoredProperty> values) {
+        if (values.isEmpty()) {
+            return Value.newBuilder().setNullValue(NullValue.NULL_VALUE).build();
+        }
+        double total = 0;
+        for (StoredProperty v : values) {
+            total += "integer".equals(v.getType()) ? v.getIntegerValue() : v.getDoubleValue();
+        }
+        return Value.newBuilder().setDoubleValue(total / values.size()).build();
     }
 
     // ── AllocateIds ────────────────────────────────────────────────────────────

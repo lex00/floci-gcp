@@ -116,16 +116,17 @@ public class CloudMonitoringService {
                 .storageKey("monitoring")
                 .protocol(ServiceProtocol.GRPC)
                 .resourceClasses(CloudMonitoringController.class, CloudMonitoringHttpController.class)
+                .api("monitoring.googleapis.com", "Cloud Monitoring API")
                 .build());
         grpcServerManager.bind(new CloudMonitoringController(this));
     }
 
     private static <T> StorageBackend<String, T> scoped(StorageBackend<String, T> store, String resourceName) {
-        String[] parts = resourceName.split("/", -1);
-        if (parts.length < 2 || !parts[0].equals("projects") || parts[1].isBlank()) {
+        String project = resourceName.startsWith("projects/") ? GcpResourceNames.parseProject(resourceName) : null;
+        if (project == null || project.isBlank()) {
             throw GcpException.invalidArgument("A projects/{project} resource name is required");
         }
-        return store instanceof ProjectAwareStorageBackend<T> aware ? aware.forProject(parts[1]) : store;
+        return store instanceof ProjectAwareStorageBackend<T> aware ? aware.forProject(project) : store;
     }
 
     private static long maxStoredSequence(StorageBackend<String, StoredTimeSeriesPoint> store) {

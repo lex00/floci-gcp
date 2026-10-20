@@ -2,8 +2,8 @@
 
 floci-gcp emulates Google Cloud KMS over gRPC and REST using the real
 `google.cloud.kms.v1.KeyManagementService` protocol. Crypto operations are backed by real local
-cryptography (AES-256-GCM for symmetric keys; RSA/EC for asymmetric keys), so encrypt/decrypt and
-sign/verify round-trips behave like GCP, including binding ciphertext to the key version, so a
+cryptography (AES-256-GCM for symmetric keys; RSA/EC for asymmetric keys; HMAC for MAC keys), so
+encrypt/decrypt, sign/verify and MAC sign/verify round-trips behave like GCP, including binding ciphertext to the key version, so a
 cross-key decrypt fails as it would in production.
 
 ## Configuration
@@ -28,6 +28,12 @@ API endpoint / transport channel and disabling credentials:
 | `ENCRYPT_DECRYPT` | `GOOGLE_SYMMETRIC_ENCRYPTION` (AES-256-GCM) | `Encrypt`, `Decrypt` |
 | `ASYMMETRIC_SIGN` | `EC_SIGN_P256_SHA256`, `RSA_SIGN_PKCS1_2048_SHA256` | `AsymmetricSign`, `GetPublicKey` |
 | `ASYMMETRIC_DECRYPT` | `RSA_DECRYPT_OAEP_2048_SHA256` | `AsymmetricDecrypt`, `GetPublicKey` |
+| `MAC` | `HMAC_SHA256`, `HMAC_SHA1`, `HMAC_SHA384`, `HMAC_SHA512`, `HMAC_SHA224` | `MacSign`, `MacVerify` |
+
+A `MAC` key needs `version_template.algorithm`, like an `ASYMMETRIC_SIGN` key. Each version holds a
+random HMAC key the size of its hash output (32 bytes for `HMAC_SHA256`). `MacVerify` returns
+`success: false` for a tag that does not match, whatever its length, rather than an error, and sets
+`verified_success_integrity` to the same value as `success`.
 
 ## Quick Start
 
@@ -162,9 +168,10 @@ verifies them and sets the corresponding `verified_*_crc32c` response flag (a mi
 - `DestroyCryptoKeyVersion`, `RestoreCryptoKeyVersion`
 - `Encrypt`, `Decrypt`
 - `GetPublicKey`, `AsymmetricSign`, `AsymmetricDecrypt`
+- `MacSign`, `MacVerify`
 - `GenerateRandomBytes`
 
 ## Not Yet Supported
 
-`RawEncrypt`/`RawDecrypt`, `MacSign`/`MacVerify`, import jobs, RSA-PSS signing, post-quantum
+`RawEncrypt`/`RawDecrypt`, import jobs, RSA-PSS signing, post-quantum
 algorithms, HSM/EXTERNAL protection levels, and IAM policy storage.

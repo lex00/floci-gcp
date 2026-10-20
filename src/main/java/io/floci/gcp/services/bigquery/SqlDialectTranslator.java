@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Rewrites a GoogleSQL {@code SELECT} into DuckDB SQL. Works on a token stream, never on raw
@@ -74,7 +75,7 @@ final class SqlDialectTranslator {
             "TIME_ADD", "TIMESTAMP_SUB", "DATETIME_SUB", "TIME_SUB", "DATE_ADD", "DATE_SUB",
             "TIMESTAMP_DIFF", "DATETIME_DIFF", "DATE_DIFF", "TIME_DIFF", "TIMESTAMP_TRUNC", "DATETIME_TRUNC",
             "DATE_TRUNC", "FORMAT_TIMESTAMP", "FORMAT_DATETIME", "FORMAT_DATE", "FORMAT_TIME",
-            "PARSE_TIMESTAMP", "PARSE_DATETIME", "PARSE_DATE", "DATE", "DATETIME", "TIMESTAMP");
+            "PARSE_TIMESTAMP", "PARSE_DATETIME", "PARSE_DATE", "DATE", "DATETIME", "TIMESTAMP", "ARRAY_AGG");
 
     /**
      * Words DuckDB reserves (or restricts) that GoogleSQL allows as plain column names; they
@@ -100,6 +101,22 @@ final class SqlDialectTranslator {
     private final Set<InformationSchema.Ref> informationSchema = new LinkedHashSet<>();
 
     private List<Token> tokens;
+    /** The {@code UNNEST} token of an unaliased MERGE source, rendered with {@link #mergeUnnestName} as its name. */
+    private Token mergeUnnestSource;
+    private String mergeUnnestName;
+    /** The alias of an aliased MERGE {@code UNNEST} source, which subqueries can still reference. */
+    private String mergeUnnestAlias;
+    /** A table's lower-cased column names, or null when they are unknown. */
+    private Function<TableRef, Set<String>> columnsOf = ref -> null;
+    /** The MERGE source table, when the source is a table rather than a subquery. */
+    private TableRef mergeSource;
+    private MergeScope mergeScope;
+
+    /**
+     * Names that refer to the MERGE target or source; the columns known of either (null when neither's
+     * are known); and whether those are all of their columns.
+     */
+    private record MergeScope(Set<String> names, Set<String> columns, boolean complete) {}
 
     private SqlDialectTranslator(String projectId, String defaultDatasetId, QueryParameters parameters) {
         this.projectId = projectId;
@@ -149,7 +166,18 @@ final class SqlDialectTranslator {
      */
     static Translation translateDml(String sql, String projectId, String defaultDatasetId,
                                     QueryParameters parameters) {
+        return translateDml(sql, projectId, defaultDatasetId, parameters, ref -> null);
+    }
+
+    /**
+     * As {@link #translateDml(String, String, String, QueryParameters)}, with {@code columnsOf} giving a
+     * table's lower-cased column names (or null when unknown), which {@code MERGE} uses to tell source
+     * columns from other names.
+     */
+    static Translation translateDml(String sql, String projectId, String defaultDatasetId,
+                                    QueryParameters parameters, Function<TableRef, Set<String>> columnsOf) {
         SqlDialectTranslator translator = new SqlDialectTranslator(projectId, defaultDatasetId, parameters);
+        translator.columnsOf = columnsOf;
         return translator.runDml(sql);
     }
 
@@ -427,6 +455,7 @@ final class SqlDialectTranslator {
             default -> "UPDATE ";
         };
         StringBuilder out = new StringBuilder(head).append(targetSql);
+        String targetAlias = target.tableId();
         int rest = path.end();
         int next = nextSignificant(rest, tokens.size());
         // UPDATE/DELETE/MERGE target alias: "t", "AS t"
@@ -441,14 +470,704 @@ final class SqlDialectTranslator {
             }
             if (aliasIndex >= 0) {
                 out.append(" AS ").append(DuckTypes.quoteIdentifier(tokens.get(aliasIndex).identifierText()));
+                targetAlias = tokens.get(aliasIndex).identifierText();
                 rest = aliasIndex + 1;
             }
+        }
+        if (first.equals("MERGE")) {
+            qualifyNotMatchedSourceColumns(rest, target, targetAlias);
         }
         out.append(render(rest, tokens.size()));
         if (first.equals("MERGE")) {
             out.append(" RETURNING merge_action");
         }
         return new Translation(out.toString().trim(), tables, informationSchema);
+    }
+
+    /**
+     * A {@code WHEN NOT MATCHED [BY TARGET]} clause has no target row, so GoogleSQL resolves a bare column
+     * in its search condition or {@code INSERT ... VALUES} to the source; dbt-bigquery's incremental
+     * MERGE relies on it ({@code INSERT (`a`) VALUES (`a`)}). DuckDB resolves those names against both
+     * tables and rejects them as ambiguous, so they are qualified with the source alias here. When the
+     * target's columns are known, only names that are also target columns are qualified: no other name
+     * can be ambiguous.
+     */
+    private void qualifyNotMatchedSourceColumns(int from, TableRef target, String targetAlias) {
+        String source = mergeSourceAlias(from);
+        String correlationSource = source != null ? source : mergeUnnestAlias;
+        if (correlationSource == null) {
+            return;
+        }
+        Set<String> targetColumns = columnsOf.apply(target);
+        Set<String> sourceColumns = mergeSource == null ? null : columnsOf.apply(mergeSource);
+        Set<String> outerColumns = null;
+        if (targetColumns != null || sourceColumns != null) {
+            outerColumns = new HashSet<>();
+            outerColumns.addAll(targetColumns != null ? targetColumns : Set.of());
+            outerColumns.addAll(sourceColumns != null ? sourceColumns : Set.of());
+        }
+        mergeScope = new MergeScope(new HashSet<>(List.of(correlationSource.toLowerCase(Locale.ROOT),
+                targetAlias.toLowerCase(Locale.ROOT), target.tableId().toLowerCase(Locale.ROOT))), outerColumns,
+                targetColumns != null && sourceColumns != null);
+        List<Integer> columns = new ArrayList<>();
+        int depth = 0;
+        int caseDepth = 0;
+        int clauseStart = -1;
+        for (int i = from; i <= tokens.size(); i++) {
+            Token t = i < tokens.size() ? tokens.get(i) : null;
+            boolean clauseEnds = t == null || (depth == 0 && caseDepth == 0 && t.isKeyword("WHEN"));
+            if (clauseEnds && clauseStart >= 0) {
+                collectBareColumns(clauseStart, i, columns);
+                clauseStart = -1;
+            }
+            if (t == null) {
+                break;
+            }
+            if (t.isPunct("(")) {
+                depth++;
+            } else if (t.isPunct(")")) {
+                depth--;
+            } else if (t.isKeyword("CASE")) {
+                caseDepth++;
+            } else if (t.isKeyword("END") && caseDepth > 0) {
+                caseDepth--;
+            } else if (depth == 0 && caseDepth == 0 && t.isKeyword("WHEN")) {
+                clauseStart = notMatchedByTargetBody(i);
+            }
+        }
+        mergeScope = null;
+        if (source == null) {
+            return;
+        }
+        for (int k = columns.size() - 1; k >= 0; k--) {
+            int at = columns.get(k);
+            if (targetColumns != null
+                    && !targetColumns.contains(tokens.get(at).identifierText().toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            tokens.add(at, new Token(Kind.PUNCT, ".", "."));
+            tokens.add(at, new Token(Kind.QIDENT, "`" + source + "`", source));
+        }
+    }
+
+    /** Index after {@code WHEN NOT MATCHED [BY TARGET]}, or -1 for any other WHEN clause. */
+    private int notMatchedByTargetBody(int when) {
+        int not = nextSignificant(when + 1, tokens.size());
+        if (not < 0 || !tokens.get(not).isKeyword("NOT")) {
+            return -1;
+        }
+        int matched = nextSignificant(not + 1, tokens.size());
+        if (matched < 0 || !tokens.get(matched).isKeyword("MATCHED")) {
+            return -1;
+        }
+        int by = nextSignificant(matched + 1, tokens.size());
+        if (by >= 0 && tokens.get(by).isKeyword("BY")) {
+            int side = nextSignificant(by + 1, tokens.size());
+            return side >= 0 && tokens.get(side).isKeyword("TARGET") ? side + 1 : -1;
+        }
+        return matched + 1;
+    }
+
+    /** The name the MERGE source goes by: its alias, or the table's own name. */
+    private String mergeSourceAlias(int from) {
+        int using = -1;
+        int depth = 0;
+        for (int i = from; i < tokens.size() && using < 0; i++) {
+            Token t = tokens.get(i);
+            if (t.isPunct("(")) {
+                depth++;
+            } else if (t.isPunct(")")) {
+                depth--;
+            } else if (depth == 0 && t.isKeyword("USING")) {
+                using = i;
+            }
+        }
+        int source = using < 0 ? -1 : nextSignificant(using + 1, tokens.size());
+        if (source < 0) {
+            return null;
+        }
+        String name = null;
+        int after;
+        int unnestOpen = tokens.get(source).isKeyword("UNNEST") ? nextSignificant(source + 1, tokens.size()) : -1;
+        if (tokens.get(source).isPunct("(")) {
+            after = nextSignificant(matchingParen(source) + 1, tokens.size());
+        } else if (unnestOpen >= 0 && tokens.get(unnestOpen).isPunct("(")) {
+            after = nextSignificant(matchingParen(unnestOpen) + 1, tokens.size());
+            if (after >= 0 && (tokens.get(after).isKeyword("AS") || tokens.get(after).kind == Kind.QIDENT
+                    || (tokens.get(after).kind == Kind.IDENT && !tokens.get(after).isKeyword("ON")))) {
+                // An aliased UNNEST renders as one STRUCT column, which the qualified names cannot reach.
+                int alias = tokens.get(after).isKeyword("AS") ? nextSignificant(after + 1, tokens.size()) : after;
+                mergeUnnestAlias = alias >= 0 ? tokens.get(alias).identifierText() : null;
+                return null;
+            }
+            // Without an alias it renders as an unnamed subquery, so it gets a name to qualify with.
+            mergeUnnestSource = tokens.get(source);
+            mergeUnnestName = unusedName(MERGE_UNNEST_SOURCE);
+            return mergeUnnestName;
+        } else {
+            int last = source;
+            List<String> segments = new ArrayList<>(pathSegments(tokens.get(last)));
+            int dot = nextSignificant(last + 1, tokens.size());
+            while (dot >= 0 && tokens.get(dot).isPunct(".")) {
+                last = nextSignificant(dot + 1, tokens.size());
+                segments.addAll(pathSegments(tokens.get(last)));
+                dot = nextSignificant(last + 1, tokens.size());
+            }
+            mergeSource = tableRefOrNull(segments);
+            String path = tokens.get(last).identifierText();
+            name = path.substring(path.lastIndexOf('.') + 1);
+            after = dot;
+        }
+        if (after >= 0 && tokens.get(after).isKeyword("AS")) {
+            after = nextSignificant(after + 1, tokens.size());
+        }
+        if (after >= 0 && (tokens.get(after).kind == Kind.QIDENT
+                || (tokens.get(after).kind == Kind.IDENT && !tokens.get(after).isKeyword("ON")))) {
+            name = tokens.get(after).identifierText();
+        }
+        return name;
+    }
+
+    /**
+     * Bare column names in {@code [from, to)}: an identifier that is not a keyword, a function name, part
+     * of a dotted path, a name introduced by AS (a type or field alias), or a word following an operand
+     * ({@code DAY} in {@code INTERVAL 1 DAY}). Also not a column: the type of a typed literal
+     * ({@code DATE '2026-01-01'}), a date part ({@code EXTRACT(DAY FROM d)}, a part argument of
+     * {@code DATE_TRUNC}, {@code DATE_DIFF} and the like, the end of an interval range, the weekday in
+     * {@code WEEK(MONDAY)}), a function called without parentheses ({@code CURRENT_DATE}), the
+     * {@code TIME ZONE} of {@code AT TIME ZONE}, the name of a named argument ({@code make_valid => TRUE}), and the
+     * types inside {@code ARRAY<...>}, {@code STRUCT<...>} and {@code RANGE<...>}. The {@code INSERT}
+     * column list names target columns and is skipped, and so is a subquery, whose bare names belong to
+     * its own tables.
+     */
+    private void collectBareColumns(int from, int to, List<Integer> columns) {
+        collectBareColumns(from, to, columns, true);
+    }
+
+    /**
+     * As {@link #collectBareColumns(int, int, List)}; when {@code mergeClause} is false the range is a plain
+     * expression, where the MERGE clause words ({@code SOURCE}, {@code INSERT}, ...) are column names.
+     */
+    private void collectBareColumns(int from, int to, List<Integer> columns, boolean mergeClause) {
+        Deque<String> calls = new ArrayDeque<>();
+        Deque<int[]> argumentIndexes = new ArrayDeque<>();
+        boolean inInsert = false;
+        for (int i = from; i < to; i++) {
+            Token t = tokens.get(i);
+            if (mergeClause && t.isKeyword("INSERT")) {
+                inInsert = true;
+                int open = nextSignificant(i + 1, to);
+                if (open >= 0 && tokens.get(open).isPunct("(")) {
+                    i = matchingParen(open);
+                }
+                continue;
+            }
+            if (t.isPunct("(")) {
+                int first = nextSignificant(i + 1, to);
+                if (first >= 0 && (tokens.get(first).isKeyword("SELECT") || tokens.get(first).isKeyword("WITH"))) {
+                    int close = matchingParen(i);
+                    if (mergeScope != null && isInSubqueryOfAnExpression(i, mergeScope.names(),
+                            mergeScope.complete() ? mergeScope.columns() : null)) {
+                        throw invalidQuery("Correlated Subquery is unsupported in " + (inInsert ? "INSERT" : "WHEN")
+                                + " clause.");
+                    }
+                    rejectCorrelatedSubquery(i, close, inInsert ? "INSERT" : "WHEN");
+                    i = close;
+                    continue;
+                }
+                int callee = previousSignificantIndex(i);
+                calls.push(callee >= 0 && tokens.get(callee).kind == Kind.IDENT ? tokens.get(callee).upper() : "");
+                argumentIndexes.push(new int[] {0});
+                continue;
+            }
+            if (t.isPunct("[")) {
+                calls.push("");
+                argumentIndexes.push(new int[] {0});
+                continue;
+            }
+            if (t.isPunct(")") || t.isPunct("]")) {
+                calls.poll();
+                argumentIndexes.poll();
+                continue;
+            }
+            if (t.isPunct(",") && !argumentIndexes.isEmpty()) {
+                argumentIndexes.peek()[0]++;
+                continue;
+            }
+            if (t.isKeyword("ARRAY") || t.isKeyword("STRUCT") || t.isKeyword("RANGE")) {
+                int open = nextSignificant(i + 1, to);
+                if (open >= 0 && tokens.get(open).isPunct("<")) {
+                    i = closingAngle(open, to);
+                }
+                continue;
+            }
+            boolean name = t.kind == Kind.QIDENT ? !t.value.contains(".")
+                    : t.kind == Kind.IDENT && !GOOGLESQL_RESERVED.contains(t.upper())
+                            && !NON_ALIAS_KEYWORDS.contains(t.upper())
+                            && !(mergeClause && MERGE_CLAUSE_WORDS.contains(t.upper()));
+            if (!name) {
+                continue;
+            }
+            int next = nextSignificant(i + 1, tokens.size());
+            Token n = next >= 0 ? tokens.get(next) : null;
+            if (n != null && (n.isPunct("(") || n.isPunct(".") || n.isPunct("=>") || n.kind == Kind.STRING
+                    || n.kind == Kind.BYTES || n.isKeyword("FROM"))) {
+                continue;
+            }
+            if (t.kind == Kind.IDENT && PARENLESS_FUNCTIONS.contains(t.upper())) {
+                continue;
+            }
+            int previous = previousSignificantIndex(i);
+            Token p = previous >= 0 ? tokens.get(previous) : null;
+            if (p != null && (p.isPunct(".") || p.isKeyword("AS") || p.isKeyword("AT") || endsMergeOperand(p))) {
+                continue;
+            }
+            if (t.isKeyword("ZONE") && p != null && p.isKeyword("TIME")) {
+                continue;
+            }
+            String call = calls.peek();
+            Integer partArgument = call == null ? null : DATE_PART_ARGUMENT.get(call);
+            boolean datePartArgument = partArgument != null && argumentIndexes.peek()[0] == partArgument
+                    && p != null && p.isPunct(",") && n != null && (n.isPunct(")") || n.isPunct(","));
+            boolean intervalRangeEnd = p != null && p.isKeyword("TO") && DATE_PART_NAMES.contains(t.upper());
+            if ("WEEK".equals(call) || datePartArgument || intervalRangeEnd) {
+                continue;
+            }
+            columns.add(i);
+        }
+    }
+
+    /** The base of the name an unaliased {@code MERGE ... USING UNNEST(...)} source is rendered and qualified with. */
+    private static final String MERGE_UNNEST_SOURCE = "_merge_source";
+
+    /** {@code base}, or {@code base_1}, {@code base_2}, ... when the statement already uses that name. */
+    private String unusedName(String base) {
+        Set<String> used = new HashSet<>();
+        for (Token t : tokens) {
+            if (t.kind == Kind.IDENT || t.kind == Kind.QIDENT) {
+                for (String part : t.identifierText().split("\\.", -1)) {
+                    used.add(part.toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        String name = base;
+        for (int n = 1; used.contains(name); n++) {
+            name = base + "_" + n;
+        }
+        return name;
+    }
+
+    /**
+     * GoogleSQL rejects a correlated subquery in a {@code WHEN NOT MATCHED} clause ("Correlated Subquery is
+     * unsupported in INSERT clause.", or "... in WHEN clause." in the condition), where DuckDB would run it
+     * or fail on an ambiguous name. That covers a subquery that reads the target or the source, a
+     * subquery nested in it that reads an enclosing subquery, and the subquery of {@code x IN (SELECT ...)}
+     * when {@code x} is not a constant, which BigQuery runs as a semi-join correlated through {@code x}.
+     * Each query level is checked on its own, against the names its enclosing levels and the MERGE make
+     * visible.
+     */
+    private void rejectCorrelatedSubquery(int open, int close, String clause) {
+        MergeScope scope = mergeScope;
+        if (scope == null) {
+            return;
+        }
+        mergeScope = null;
+        try {
+            rejectCorrelatedQuery(open, close, clause, scope.names(), scope.columns());
+        } finally {
+            mergeScope = scope;
+        }
+    }
+
+    /**
+     * Rejects the query in {@code (open, close)} when it reads an enclosing name: a name qualified with
+     * one of {@code outerNames} that none of its own FROM items hides, or, when the columns of all its
+     * FROM items are known, a bare name in {@code outerColumns} that is not one of their columns or, from
+     * {@code GROUP BY} on, a select-list alias. {@code outerColumns} is null when the enclosing columns
+     * are unknown. Then checks
+     * each subquery nested in it, with this level's names and columns added to the enclosing ones.
+     */
+    private void rejectCorrelatedQuery(int open, int close, String clause, Set<String> outerNames,
+                                       Set<String> outerColumns) {
+        Set<String> localNames = new HashSet<>();
+        Set<String> localColumns = new HashSet<>();
+        Set<String> aliases = new HashSet<>();
+        Set<Integer> fromItems = new HashSet<>();
+        List<int[]> nested = new ArrayList<>();
+        int first = nextSignificant(open + 1, close);
+        boolean known = first < 0 || !tokens.get(first).isKeyword("WITH");
+        boolean seenFrom = false;
+        boolean inFrom = false;
+        int aliasesVisibleFrom = -1;
+        int itemStart = -1;
+        int depth = 0;
+        for (int k = open + 1; k < close; k++) {
+            Token t = tokens.get(k);
+            if (t.isPunct("(")) {
+                int inner = nextSignificant(k + 1, close);
+                if (inner >= 0 && (tokens.get(inner).isKeyword("SELECT") || tokens.get(inner).isKeyword("WITH"))) {
+                    int end = matchingParen(k);
+                    nested.add(new int[] {k, end});
+                    k = end;
+                } else {
+                    depth++;
+                }
+                continue;
+            }
+            if (t.isPunct(")")) {
+                depth--;
+                continue;
+            }
+            if (depth != 0) {
+                continue;
+            }
+            if (!seenFrom && t.isKeyword("SELECT")) {
+                itemStart = k;
+                continue;
+            }
+            if (!seenFrom && itemStart >= 0 && (t.isPunct(",") || t.isKeyword("FROM"))) {
+                recordImplicitAlias(itemStart, k, aliases);
+                itemStart = t.isPunct(",") ? k : -1;
+                if (t.isPunct(",")) {
+                    continue;
+                }
+            }
+            if (t.isKeyword("FROM") || t.isKeyword("JOIN") || (inFrom && t.isPunct(","))) {
+                seenFrom = true;
+                inFrom = true;
+                known &= fromItem(nextSignificant(k + 1, close), close, localNames, localColumns, fromItems);
+            } else if (t.kind == Kind.IDENT && FROM_CLAUSE_ENDS.contains(t.upper())) {
+                inFrom = false;
+                if (aliasesVisibleFrom < 0 && ALIAS_CLAUSES.contains(t.upper())) {
+                    aliasesVisibleFrom = k;
+                }
+            } else if (!seenFrom && t.isKeyword("AS")) {
+                int alias = nextSignificant(k + 1, close);
+                if (alias >= 0 && (tokens.get(alias).kind == Kind.IDENT || tokens.get(alias).kind == Kind.QIDENT)) {
+                    aliases.add(tokens.get(alias).identifierText().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        if (!seenFrom && itemStart >= 0) {
+            recordImplicitAlias(itemStart, close, aliases);
+        }
+        Set<String> visible = new HashSet<>(outerNames);
+        visible.removeAll(localNames);
+        Set<String> operandNames = new HashSet<>(outerNames);
+        operandNames.addAll(localNames);
+        Set<String> enclosingColumns = null;
+        if (outerColumns != null && known) {
+            enclosingColumns = new HashSet<>(outerColumns);
+            enclosingColumns.addAll(localColumns);
+        }
+        for (int[] sub : nested) {
+            if (isInSubqueryOfAnExpression(sub[0], operandNames, null)) {
+                throw invalidQuery("Correlated Subquery is unsupported in " + clause + " clause.");
+            }
+        }
+        int nextNested = 0;
+        for (int k = open + 1; k < close; k++) {
+            if (nextNested < nested.size() && k == nested.get(nextNested)[0]) {
+                k = nested.get(nextNested++)[1];
+                continue;
+            }
+            Token t = tokens.get(k);
+            if (fromItems.contains(k) || (t.kind != Kind.IDENT && t.kind != Kind.QIDENT)) {
+                continue;
+            }
+            int previous = previousSignificantIndex(k);
+            if (previous >= 0 && tokens.get(previous).isPunct(".")) {
+                continue;
+            }
+            String qualifier = null;
+            if (t.kind == Kind.QIDENT && t.value.contains(".")) {
+                qualifier = t.value.substring(0, t.value.indexOf('.'));
+            } else {
+                int next = nextSignificant(k + 1, close);
+                if (next >= 0 && tokens.get(next).isPunct(".")) {
+                    qualifier = t.identifierText();
+                }
+            }
+            if (qualifier != null && visible.contains(qualifier.toLowerCase(Locale.ROOT))) {
+                throw invalidQuery("Correlated Subquery is unsupported in " + clause + " clause.");
+            }
+        }
+        if (known && outerColumns != null) {
+            List<Integer> bare = new ArrayList<>();
+            collectBareColumns(open + 1, close, bare);
+            for (int k : bare) {
+                String name = tokens.get(k).identifierText().toLowerCase(Locale.ROOT);
+                boolean alias = aliases.contains(name) && aliasesVisibleFrom >= 0 && k > aliasesVisibleFrom;
+                if (!fromItems.contains(k) && outerColumns.contains(name) && !localColumns.contains(name) && !alias) {
+                    throw invalidQuery("Correlated Subquery is unsupported in " + clause + " clause.");
+                }
+            }
+        }
+        visible.addAll(localNames);
+        for (int[] sub : nested) {
+            rejectCorrelatedQuery(sub[0], sub[1], clause, visible, enclosingColumns);
+        }
+    }
+
+    /**
+     * Whether the subquery opening at {@code open} is the right side of {@code x [NOT] IN} where {@code x}
+     * reads an enclosing row, which BigQuery runs as a semi-join correlated through {@code x}. The operand
+     * is walked back from {@code IN} to its start (a comparison, a logical operator, a comma or an enclosing
+     * bracket). It reads a row through a name qualified with one of {@code names}, or through a bare column
+     * name as {@link #collectBareColumns} finds them (so not a function, a cast type, a date part or the
+     * type of a typed literal) that is one of {@code columns}, or any such name when {@code columns} is null.
+     */
+    private boolean isInSubqueryOfAnExpression(int open, Set<String> names, Set<String> columns) {
+        int in = previousSignificantIndex(open);
+        if (in < 0 || !tokens.get(in).isKeyword("IN")) {
+            return false;
+        }
+        int end = previousSignificantIndex(in);
+        if (end >= 0 && tokens.get(end).isKeyword("NOT")) {
+            end = previousSignificantIndex(end);
+        }
+        if (end < 0) {
+            return false;
+        }
+        int start = 0;
+        int depth = 0;
+        for (int k = end; k >= 0; k--) {
+            Token t = tokens.get(k);
+            if (t.isPunct(")") || t.isPunct("]")) {
+                depth++;
+            } else if (t.isPunct("(") || t.isPunct("[")) {
+                if (depth == 0) {
+                    start = k + 1;
+                    break;
+                }
+                depth--;
+            } else if (depth == 0 && (t.isPunct(",") || (t.kind == Kind.PUNCT && t.text.matches("[=<>!]+"))
+                    || (t.kind == Kind.IDENT && IN_OPERAND_BOUNDARIES.contains(t.upper())))) {
+                start = k + 1;
+                break;
+            }
+        }
+        for (int k = start; k <= end; k++) {
+            Token t = tokens.get(k);
+            if (t.kind != Kind.IDENT && t.kind != Kind.QIDENT) {
+                continue;
+            }
+            int previous = previousSignificantIndex(k);
+            if (previous >= 0 && tokens.get(previous).isPunct(".")) {
+                continue;
+            }
+            String qualifier = null;
+            if (t.kind == Kind.QIDENT && t.value.contains(".")) {
+                qualifier = t.value.substring(0, t.value.indexOf('.'));
+            } else {
+                int next = nextSignificant(k + 1, end + 1);
+                if (next >= 0 && tokens.get(next).isPunct(".")) {
+                    qualifier = t.identifierText();
+                }
+            }
+            if (qualifier != null && names.contains(qualifier.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        List<Integer> bare = new ArrayList<>();
+        MergeScope scope = mergeScope;
+        mergeScope = null;
+        try {
+            collectBareColumns(start, end + 1, bare, false);
+        } finally {
+            mergeScope = scope;
+        }
+        for (int k : bare) {
+            if (columns == null || columns.contains(tokens.get(k).identifierText().toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Records the implicit alias of the select item in {@code (start, end)}: its last name when no
+     * {@code AS} comes before it and an operand ends right before it ({@code MAX(name) v}, {@code lk v}).
+     */
+    private void recordImplicitAlias(int start, int end, Set<String> aliases) {
+        int last = previousSignificantIndex(end);
+        if (last <= start) {
+            return;
+        }
+        Token alias = tokens.get(last);
+        boolean name = alias.kind == Kind.QIDENT || (alias.kind == Kind.IDENT
+                && !GOOGLESQL_RESERVED.contains(alias.upper()) && !NON_ALIAS_KEYWORDS.contains(alias.upper()));
+        int previous = previousSignificantIndex(last);
+        if (!name || previous <= start) {
+            return;
+        }
+        Token p = tokens.get(previous);
+        if (!p.isPunct(".") && !p.isKeyword("AS") && (endsMergeOperand(p) || p.isKeyword("END"))) {
+            aliases.add(alias.identifierText().toLowerCase(Locale.ROOT));
+        }
+    }
+
+    /** Words before the left operand of {@code IN}: walking back past one leaves the operand. */
+    private static final Set<String> IN_OPERAND_BOUNDARIES = Set.of("AND", "OR", "NOT", "WHEN", "THEN", "ELSE",
+            "CASE", "SELECT", "WHERE", "ON", "HAVING", "QUALIFY", "BETWEEN", "IS");
+
+    /** The clauses from which on a select-list alias hides a column of the same name. */
+    private static final Set<String> ALIAS_CLAUSES = Set.of("GROUP", "HAVING", "QUALIFY", "ORDER");
+
+    /** Words that end a FROM clause, so that a comma after them no longer starts a FROM item. */
+    private static final Set<String> FROM_CLAUSE_ENDS = Set.of("WHERE", "GROUP", "HAVING", "QUALIFY", "WINDOW",
+            "ORDER", "LIMIT", "UNION", "INTERSECT", "EXCEPT");
+
+    /**
+     * Records the FROM item starting at {@code item}: its table name and alias in {@code names}, its
+     * tokens in {@code fromItems}, and its columns in {@code columns}. Returns false when its columns are
+     * unknown: a subquery, an {@code UNNEST}, a parenthesized join, or a table this pass cannot look up.
+     */
+    private boolean fromItem(int item, int close, Set<String> names, Set<String> columns, Set<Integer> fromItems) {
+        if (item < 0) {
+            return false;
+        }
+        Token t = tokens.get(item);
+        int end;
+        boolean known;
+        int inner = t.isPunct("(") ? nextSignificant(item + 1, close) : -1;
+        if (inner >= 0 && !tokens.get(inner).isKeyword("SELECT") && !tokens.get(inner).isKeyword("WITH")) {
+            end = matchingParen(item);
+            known = joinedItems(item, end, names, columns, fromItems);
+        } else if (t.isPunct("(") || t.isKeyword("UNNEST")) {
+            int paren = t.isPunct("(") ? item : nextSignificant(item + 1, close);
+            if (paren < 0 || !tokens.get(paren).isPunct("(")) {
+                return false;
+            }
+            end = matchingParen(paren);
+            known = false;
+        } else if (t.kind == Kind.IDENT || t.kind == Kind.QIDENT) {
+            List<String> segments = new ArrayList<>(pathSegments(t));
+            end = item;
+            fromItems.add(item);
+            int dot = nextSignificant(end + 1, close);
+            while (dot >= 0 && tokens.get(dot).isPunct(".")) {
+                int part = nextSignificant(dot + 1, close);
+                if (part < 0) {
+                    break;
+                }
+                end = part;
+                fromItems.add(part);
+                segments.addAll(pathSegments(tokens.get(part)));
+                dot = nextSignificant(end + 1, close);
+            }
+            names.add(segments.getLast().toLowerCase(Locale.ROOT));
+            TableRef ref = tableRefOrNull(segments);
+            Set<String> tableColumns = ref == null ? null : columnsOf.apply(ref);
+            known = tableColumns != null;
+            if (known) {
+                columns.addAll(tableColumns);
+            }
+        } else {
+            return false;
+        }
+        int alias = nextSignificant(end + 1, close);
+        if (alias >= 0 && tokens.get(alias).isKeyword("AS")) {
+            alias = nextSignificant(alias + 1, close);
+        }
+        if (alias >= 0 && (tokens.get(alias).kind == Kind.QIDENT || (tokens.get(alias).kind == Kind.IDENT
+                && !GOOGLESQL_RESERVED.contains(tokens.get(alias).upper())
+                && !NON_ALIAS_KEYWORDS.contains(tokens.get(alias).upper())))) {
+            fromItems.add(alias);
+            names.add(tokens.get(alias).identifierText().toLowerCase(Locale.ROOT));
+        }
+        return known;
+    }
+
+    /**
+     * Records the FROM items of the parenthesized join in {@code (open, close)}, as {@link #fromItem} does;
+     * false when the columns of any of them are unknown.
+     */
+    private boolean joinedItems(int open, int close, Set<String> names, Set<String> columns,
+                                Set<Integer> fromItems) {
+        boolean known = fromItem(nextSignificant(open + 1, close), close, names, columns, fromItems);
+        int depth = 0;
+        for (int k = open + 1; k < close; k++) {
+            Token t = tokens.get(k);
+            if (t.isPunct("(")) {
+                depth++;
+            } else if (t.isPunct(")")) {
+                depth--;
+            } else if (depth == 0 && (t.isKeyword("JOIN") || t.isPunct(","))) {
+                known &= fromItem(nextSignificant(k + 1, close), close, names, columns, fromItems);
+            }
+        }
+        return known;
+    }
+
+    private static List<String> pathSegments(Token t) {
+        return t.kind == Kind.QIDENT ? List.of(t.value.split("\\.", -1)) : List.of(t.text);
+    }
+
+    /** The table a path names, or null when it names none this pass can look up. */
+    private TableRef tableRefOrNull(List<String> segments) {
+        try {
+            return resolveTable(segments);
+        } catch (GcpException e) {
+            return null;
+        }
+    }
+
+    private static final Set<String> MERGE_CLAUSE_WORDS = Set.of("MATCHED", "TARGET", "SOURCE", "INSERT",
+            "VALUES", "ROW", "UPDATE", "DELETE");
+
+    /** Functions BigQuery lets you call without parentheses. */
+    private static final Set<String> PARENLESS_FUNCTIONS = Set.of("CURRENT_DATE", "CURRENT_DATETIME", "CURRENT_TIME",
+            "CURRENT_TIMESTAMP");
+
+    /**
+     * The 0-based argument that holds the date part ({@code DATE_TRUNC(d, MONTH)},
+     * {@code TIMESTAMP_TRUNC(ts, DAY, 'UTC')}, {@code DATE_DIFF(a, b, DAY)}); the other arguments are
+     * expressions, so a column named {@code day} there is still a column.
+     */
+    private static final Map<String, Integer> DATE_PART_ARGUMENT = Map.of("DATE_TRUNC", 1, "DATETIME_TRUNC", 1,
+            "TIMESTAMP_TRUNC", 1, "TIME_TRUNC", 1, "LAST_DAY", 1, "DATE_DIFF", 2, "DATETIME_DIFF", 2,
+            "TIMESTAMP_DIFF", 2, "TIME_DIFF", 2);
+
+    /** Date part names; after {@code TO} in an interval range ({@code INTERVAL '0-1' YEAR TO MONTH}) one is not a column. */
+    private static final Set<String> DATE_PART_NAMES = Set.of("MICROSECOND", "MILLISECOND", "SECOND", "MINUTE",
+            "HOUR", "DAY", "DAYOFWEEK", "DAYOFYEAR", "WEEK", "ISOWEEK", "MONTH", "QUARTER", "YEAR", "ISOYEAR",
+            "DATE", "DATETIME", "TIME");
+
+    private int previousSignificantIndex(int index) {
+        for (int k = index - 1; k >= 0; k--) {
+            if (tokens.get(k).kind != Kind.SPACE && tokens.get(k).kind != Kind.RAW) {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    /** Index of the {@code >} that closes the type bracket opened at {@code open}; {@code >>} closes two. */
+    private int closingAngle(int open, int to) {
+        int depth = 0;
+        for (int i = open; i < to; i++) {
+            Token t = tokens.get(i);
+            if (t.isPunct("<")) {
+                depth++;
+            } else if (t.isPunct(">")) {
+                depth--;
+            } else if (t.isPunct(">>")) {
+                depth -= 2;
+            }
+            if (depth <= 0) {
+                return i;
+            }
+        }
+        return to - 1;
+    }
+
+    /** True when {@code t} can end an operand, so a word right after it is not a column reference. */
+    private static boolean endsMergeOperand(Token t) {
+        return t.kind == Kind.NUMBER || t.kind == Kind.STRING || t.kind == Kind.QIDENT
+                || t.isPunct(")") || t.isPunct("]")
+                || (t.kind == Kind.IDENT && !GOOGLESQL_RESERVED.contains(t.upper())
+                        && !NON_ALIAS_KEYWORDS.contains(t.upper()) && !MERGE_CLAUSE_WORDS.contains(t.upper()));
     }
 
     // ── Statement parsing helpers ───────────────────────────────────────────
@@ -872,13 +1591,116 @@ final class SqlDialectTranslator {
 
     /**
      * BigQuery names unaliased, non-column expressions in the outermost select list
-     * {@code f0_}, {@code f1_}, … ; DuckDB would name them after the expression text.
+     * {@code f0_}, {@code f1_}, … ; DuckDB would name them after the expression text. In a nested
+     * select list (subquery, CTE, scalar subquery) such a column stays anonymous: BigQuery calls it
+     * {@code $col<position>} and names it {@code f<n>_} only if a {@code *} brings it into the result,
+     * numbered with the result's other anonymous columns. Those get {@code AS "$col<position>"} here
+     * and are numbered once the query has run and the output order is known; so are the outermost
+     * list's own anonymous columns when that list expands a {@code *}.
      */
     private void nameAnonymousColumns() {
-        int select = firstTopLevelSelect();
-        if (select < 0) {
+        int outermost = firstTopLevelSelect();
+        if (outermost < 0) {
             return;
         }
+        int outerDepth = 0;
+        for (int i = 0; i < outermost; i++) {
+            if (tokens.get(i).isPunct("(")) {
+                outerDepth++;
+            } else if (tokens.get(i).isPunct(")")) {
+                outerDepth--;
+            }
+        }
+        // Later branches of a top-level set operation take their column names from the first one.
+        List<Integer> selects = new ArrayList<>();
+        int depth = 0;
+        for (int i = 0; i < tokens.size(); i++) {
+            Token t = tokens.get(i);
+            if (t.isPunct("(")) {
+                depth++;
+            } else if (t.isPunct(")")) {
+                depth--;
+            } else if (t.isKeyword("SELECT") && (i == outermost || depth > outerDepth)) {
+                selects.add(i);
+            }
+        }
+        // From the last SELECT back: names are inserted after a SELECT, so earlier ones keep their index.
+        for (int k = selects.size() - 1; k >= 0; k--) {
+            int select = selects.get(k);
+            List<int[]> items = selectItems(select);
+            if (items == null) {
+                continue;
+            }
+            boolean positional = select != outermost || items.stream().anyMatch(this::expandsStar);
+            List<int[]> anonymous = new ArrayList<>();
+            for (int position = 0; position < items.size(); position++) {
+                int[] item = items.get(position);
+                if (needsGeneratedName(item[0], item[1])) {
+                    int last = item[1] - 1;
+                    while (tokens.get(last).kind == Kind.SPACE) {
+                        last--;
+                    }
+                    anonymous.add(new int[] {last + 1, position + 1});
+                }
+            }
+            // BigQuery numbers anonymous columns with the next f<n>_ that no other column of the result uses.
+            List<String> generated = new ArrayList<>();
+            if (!positional) {
+                Set<String> taken = new HashSet<>();
+                for (int[] item : items) {
+                    String name = needsGeneratedName(item[0], item[1]) ? null : outputName(item[0], item[1]);
+                    if (name != null) {
+                        taken.add(name);
+                    }
+                }
+                int next = 0;
+                for (int n = 0; n < anonymous.size(); n++) {
+                    while (taken.contains("f" + next + "_")) {
+                        next++;
+                    }
+                    generated.add("f" + next++ + "_");
+                }
+            }
+            // Insert from the back so earlier indexes stay valid.
+            for (int n = anonymous.size() - 1; n >= 0; n--) {
+                String alias = positional ? " AS " + DuckTypes.quoteIdentifier("$col" + anonymous.get(n)[1])
+                        : " AS " + generated.get(n);
+                tokens.add(anonymous.get(n)[0], Token.raw(alias));
+            }
+        }
+    }
+
+    /** The lower-cased name a named select item gives its column: its alias or the column it reads. */
+    private String outputName(int start, int end) {
+        List<Token> item = significant(start, end);
+        if (item.isEmpty()) {
+            return null;
+        }
+        Token last = item.getLast();
+        if (last.kind != Kind.IDENT && last.kind != Kind.QIDENT) {
+            return null;
+        }
+        String name = last.identifierText();
+        return name.substring(name.lastIndexOf('.') + 1).toLowerCase(Locale.ROOT);
+    }
+
+    /** True for a {@code *}, {@code t.*} or {@code * EXCEPT/REPLACE (...)} select item. */
+    private boolean expandsStar(int[] item) {
+        List<Token> significant = significant(item[0], item[1]);
+        for (int k = 0; k < significant.size(); k++) {
+            if (significant.get(k).isPunct("*") && (k == significant.size() - 1
+                    || significant.get(k + 1).isKeyword("EXCEPT") || significant.get(k + 1).isKeyword("REPLACE"))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The items of the select list that starts at {@code select}, as {@code [start, end)} token ranges,
+     * or null for {@code SELECT AS STRUCT} / {@code AS VALUE}, whose fields are named differently.
+     */
+    private List<int[]> selectItems(int select) {
         int start = select + 1;
         int first = nextSignificant(start, tokens.size());
         while (first >= 0 && (tokens.get(first).isKeyword("DISTINCT") || tokens.get(first).isKeyword("ALL"))) {
@@ -886,7 +1708,7 @@ final class SqlDialectTranslator {
             first = nextSignificant(start, tokens.size());
         }
         if (first >= 0 && tokens.get(first).isKeyword("AS")) {
-            return; // SELECT AS STRUCT / AS VALUE
+            return null;
         }
         int end = start;
         int depth = 0;
@@ -905,26 +1727,12 @@ final class SqlDialectTranslator {
                 items.add(new int[] {itemStart, end});
                 itemStart = end + 1;
             } else if (depth == 0 && t.kind == Kind.IDENT
-                    && (t.isKeyword("FROM") || CLAUSE_END_KEYWORDS.contains(t.upper()))) {
+                    && (t.isKeyword("FROM") || CLAUSE_END_KEYWORDS.contains(t.upper())) && !followsStar(end)) {
                 break;
             }
         }
         items.add(new int[] {itemStart, end});
-
-        List<Integer> insertAt = new ArrayList<>();
-        for (int[] item : items) {
-            if (needsGeneratedName(item[0], item[1])) {
-                int last = item[1] - 1;
-                while (tokens.get(last).kind == Kind.SPACE) {
-                    last--;
-                }
-                insertAt.add(last + 1);
-            }
-        }
-        // Insert from the back so earlier indexes stay valid.
-        for (int k = insertAt.size() - 1; k >= 0; k--) {
-            tokens.add(insertAt.get(k), Token.raw(" AS f" + k + "_"));
-        }
+        return items;
     }
 
     /**
@@ -1381,6 +2189,9 @@ final class SqlDialectTranslator {
         if (nameIndex < 0) {
             // Unaliased: GoogleSQL expands STRUCT elements into one column per field.
             out.append("(SELECT UNNEST(").append(array).append(", max_depth := 2))");
+            if (tokens.get(i) == mergeUnnestSource) {
+                out.append(" AS ").append(DuckTypes.quoteIdentifier(mergeUnnestName));
+            }
             return close + 1;
         }
         out.append("UNNEST(").append(array).append(')');
@@ -1504,6 +2315,9 @@ final class SqlDialectTranslator {
             }
             case "STRUCT" -> {
                 return renderStruct(open, close);
+            }
+            case "ARRAY_AGG" -> {
+                return renderArrayAgg(original, open, close);
             }
             default -> {
                 // fall through to argument-based shims
@@ -1795,6 +2609,91 @@ final class SqlDialectTranslator {
     }
 
     // ── Token helpers ───────────────────────────────────────────────────────
+
+    /**
+     * {@code ARRAY_AGG([DISTINCT] expr [{IGNORE|RESPECT} NULLS] [ORDER BY …] [LIMIT n])}: DuckDB has no
+     * null modifier and no LIMIT inside {@code array_agg}. {@code RESPECT NULLS} is the default and is
+     * dropped; {@code IGNORE NULLS} becomes an aggregate {@code FILTER} on the aggregated expression;
+     * {@code LIMIT n} keeps the first n elements with {@code list_slice}. BigQuery rejects all of them on
+     * the analytic form. Returns null without any of them, so the call is rendered as before.
+     */
+    private String renderArrayAgg(String original, int open, int close) {
+        int modifier = -1;
+        int limit = -1;
+        int depth = 0;
+        for (int k = open + 1; k < close; k++) {
+            Token t = tokens.get(k);
+            if (t.isPunct("(") || t.isPunct("[")) {
+                depth++;
+            } else if (t.isPunct(")") || t.isPunct("]")) {
+                depth--;
+            } else if (depth > 0 || isPrecededByDot(k)) {
+                // A field name after a dot may be a keyword: `t.limit`, `t.ignore`.
+                continue;
+            } else if (t.isKeyword("IGNORE") || t.isKeyword("RESPECT")) {
+                int nulls = nextSignificant(k + 1, close);
+                if (nulls >= 0 && tokens.get(nulls).isKeyword("NULLS")) {
+                    modifier = k;
+                }
+            } else if (t.isKeyword("LIMIT")) {
+                limit = k;
+            }
+        }
+        if (modifier < 0 && limit < 0) {
+            return null;
+        }
+        int over = nextSignificant(close + 1, tokens.size());
+        if (over >= 0 && tokens.get(over).isKeyword("OVER")) {
+            throw invalidQuery(modifier >= 0
+                    ? "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS."
+                    : "LIMIT in arguments is not supported on analytic functions");
+        }
+        int bodyEnd = limit >= 0 ? limit : close;
+        String call;
+        if (modifier < 0) {
+            call = original + "(" + render(open + 1, bodyEnd).trim() + ")";
+        } else {
+            // Each range is rendered once, in source order: rendering consumes positional parameters.
+            int expressionStart = nextSignificant(open + 1, modifier);
+            if (expressionStart >= 0 && tokens.get(expressionStart).isKeyword("DISTINCT")) {
+                expressionStart++;
+            }
+            String distinct = render(open + 1, expressionStart).trim();
+            String expression = render(expressionStart, modifier).trim();
+            String rest = render(nextSignificant(modifier + 1, close) + 1, bodyEnd).trim();
+            String body = (distinct + " " + expression + " " + rest).trim();
+            call = original + "(" + body + ")";
+            if (tokens.get(modifier).isKeyword("IGNORE")) {
+                call += " FILTER (WHERE (" + expression + ") IS NOT NULL)";
+            }
+        }
+        if (limit >= 0) {
+            call = "list_slice(" + call + ", 1, " + arrayAggLimit(limit, close) + ")";
+        }
+        return call;
+    }
+
+    /**
+     * The {@code LIMIT} of an {@code ARRAY_AGG}: BigQuery takes only a non-negative integer literal or a
+     * query parameter, and rejects a negative parameter value when the query runs.
+     */
+    private String arrayAggLimit(int limit, int close) {
+        List<Token> value = significant(limit + 1, close);
+        if (value.size() == 1 && value.getFirst().kind == Kind.NUMBER && value.getFirst().text.matches("\\d+")) {
+            return value.getFirst().text;
+        }
+        if (value.size() == 2 && value.getFirst().isPunct("-") && value.get(1).kind == Kind.NUMBER
+                && value.get(1).text.matches("\\d+")) {
+            throw invalidQuery("LIMIT expects a non-negative integer literal or parameter");
+        }
+        if (value.size() == 1 && (value.getFirst().kind == Kind.NAMED_PARAM
+                || value.getFirst().kind == Kind.POSITIONAL_PARAM)) {
+            String parameter = render(limit + 1, close).trim();
+            return "(CASE WHEN (" + parameter + ") < 0 THEN error('LIMIT value should not be negative') ELSE ("
+                    + parameter + ") END)";
+        }
+        throw invalidQuery("LIMIT expects an integer literal or parameter");
+    }
 
     private List<String> arguments(int open, int close) {
         List<String> args = new ArrayList<>();

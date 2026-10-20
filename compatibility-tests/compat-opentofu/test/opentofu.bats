@@ -535,3 +535,63 @@ setup() {
     run tofu plan -detailed-exitcode -input=false -no-color -target=google_compute_instance.compat -target=google_compute_firewall.compat
     assert_success
 }
+
+# ── Label Round Trip ──────────────────────────────────────────────────────────
+
+LABEL_TARGETS="-target=google_storage_bucket.labels -target=google_pubsub_topic.labels -target=google_pubsub_subscription.labels"
+
+label_urls() {
+    printf '%s\n' \
+        "${FLOCI_ENDPOINT}/storage/v1/b/floci-compat-labels-tofu" \
+        "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/topics/floci-compat-labels-tofu" \
+        "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/subscriptions/floci-compat-labels-sub-tofu"
+}
+
+@test "OpenTofu: bucket IAM policy holds the viewer grant" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/storage/v1/b/floci-compat-labels-tofu/iam")
+    [[ "$result" == *'roles/storage.objectViewer'* ]]
+    [[ "$result" == *'floci-compat-sa-tofu@'* ]]
+}
+
+@test "OpenTofu: bucket, topic and subscription hold the applied labels" {
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" == *'"env":"compat"'* ]]
+        [[ "$result" == *'"team":"data"'* ]]
+    done
+}
+
+@test "OpenTofu: labelled resources plan clean after apply" {
+    run tofu plan -detailed-exitcode -input=false -no-color $LABEL_TARGETS
+    assert_success
+}
+
+@test "OpenTofu: changing one label plans only that change" {
+    run tofu plan -input=false -no-color $LABEL_TARGETS -var='label_round_trip={env="compat",team="ml"}'
+    assert_success
+    assert_output --partial 'Plan: 0 to add, 3 to change, 0 to destroy.'
+    assert_output --partial '"team" = "data" -> "ml"'
+    refute_output --partial '"env" = "compat" ->'
+}
+
+@test "OpenTofu: changed label reaches each resource" {
+    run tofu apply -input=false -auto-approve -no-color $LABEL_TARGETS -var='label_round_trip={env="compat",team="ml"}'
+    assert_success
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" == *'"team":"ml"'* ]]
+        [[ "$result" == *'"env":"compat"'* ]]
+    done
+}
+
+@test "OpenTofu: clearing the labels removes them from each resource" {
+    run tofu apply -input=false -auto-approve -no-color $LABEL_TARGETS -var='label_round_trip={}'
+    assert_success
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" != *'"team"'* ]]
+        [[ "$result" != *'"env"'* ]]
+    done
+    run tofu plan -detailed-exitcode -input=false -no-color $LABEL_TARGETS -var='label_round_trip={}'
+    assert_success
+}

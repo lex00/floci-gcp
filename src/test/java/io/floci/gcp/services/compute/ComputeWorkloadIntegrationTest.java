@@ -34,6 +34,23 @@ class ComputeWorkloadIntegrationTest extends ComputeTestSupport {
         done(root, given().delete(root + zone + "/disks/vm"));
         done(root, given().delete(root + zone + "/disks/data"));
     }
+    @Test void sharedCoreE2MachineTypes() throws Exception {
+        String root = root(), zone = "/zones/us-central1-a";
+        for (var expected : List.of(List.of("e2-micro", 1024), List.of("e2-small", 2048), List.of("e2-medium", 4096))) {
+            JsonPath type = given().get(root + zone + "/machineTypes/" + expected.get(0)).then().statusCode(200).extract().jsonPath();
+            assertEquals(2, type.getInt("guestCpus"));
+            assertEquals(expected.get(1), type.getInt("memoryMb"));
+            assertTrue(type.getBoolean("isSharedCpu"));
+        }
+        assertFalse(given().get(root + zone + "/machineTypes/e2-standard-2").jsonPath().getBoolean("isSharedCpu"));
+        done(root, post(root + "/global/networks", Map.of("name", "net", "autoCreateSubnetworks", false)));
+        done(root, post(root + "/regions/us-central1/subnetworks", Map.of("name", "subnet", "network", "global/networks/net", "ipCidrRange", "10.10.0.0/24")));
+        done(root, post(root + zone + "/disks", Map.of("name", "boot", "sizeGb", "10")));
+        done(root, post(root + zone + "/instances", Map.of("name", "small", "machineType", "zones/us-central1-a/machineTypes/e2-small",
+                "networkInterfaces", List.of(Map.of("subnetwork", "regions/us-central1/subnetworks/subnet")),
+                "disks", List.of(Map.of("boot", true, "source", "zones/us-central1-a/disks/boot")))));
+        assertTrue(given().get(root + zone + "/instances/small").jsonPath().getString("machineType").endsWith("/machineTypes/e2-small"));
+    }
     @Test void g2WorkstationWithVirtualWorkstationGpu() throws Exception {
         String root = root(), zone = "/zones/us-central1-a";
         JsonPath machineTypes = given().get(root + zone + "/machineTypes").jsonPath();

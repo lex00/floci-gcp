@@ -537,3 +537,63 @@ setup() {
     run terraform plan -detailed-exitcode -input=false -no-color -target=google_compute_instance.compat -target=google_compute_firewall.compat
     assert_success
 }
+
+# ── Label Round Trip ──────────────────────────────────────────────────────────
+
+LABEL_TARGETS="-target=google_storage_bucket.labels -target=google_pubsub_topic.labels -target=google_pubsub_subscription.labels"
+
+label_urls() {
+    printf '%s\n' \
+        "${FLOCI_ENDPOINT}/storage/v1/b/floci-compat-labels" \
+        "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/topics/floci-compat-labels" \
+        "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}/subscriptions/floci-compat-labels-sub"
+}
+
+@test "Terraform: bucket IAM policy holds the viewer grant" {
+    result=$(gcp_curl "${FLOCI_ENDPOINT}/storage/v1/b/floci-compat-labels/iam")
+    [[ "$result" == *'roles/storage.objectViewer'* ]]
+    [[ "$result" == *'floci-compat-sa@'* ]]
+}
+
+@test "Terraform: bucket, topic and subscription hold the applied labels" {
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" == *'"env":"compat"'* ]]
+        [[ "$result" == *'"team":"data"'* ]]
+    done
+}
+
+@test "Terraform: labelled resources plan clean after apply" {
+    run terraform plan -detailed-exitcode -input=false -no-color $LABEL_TARGETS
+    assert_success
+}
+
+@test "Terraform: changing one label plans only that change" {
+    run terraform plan -input=false -no-color $LABEL_TARGETS -var='label_round_trip={env="compat",team="ml"}'
+    assert_success
+    assert_output --partial 'Plan: 0 to add, 3 to change, 0 to destroy.'
+    assert_output --partial '"team" = "data" -> "ml"'
+    refute_output --partial '"env" = "compat" ->'
+}
+
+@test "Terraform: changed label reaches each resource" {
+    run terraform apply -input=false -auto-approve -no-color $LABEL_TARGETS -var='label_round_trip={env="compat",team="ml"}'
+    assert_success
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" == *'"team":"ml"'* ]]
+        [[ "$result" == *'"env":"compat"'* ]]
+    done
+}
+
+@test "Terraform: clearing the labels removes them from each resource" {
+    run terraform apply -input=false -auto-approve -no-color $LABEL_TARGETS -var='label_round_trip={}'
+    assert_success
+    for url in $(label_urls); do
+        result=$(gcp_curl "$url")
+        [[ "$result" != *'"team"'* ]]
+        [[ "$result" != *'"env"'* ]]
+    done
+    run terraform plan -detailed-exitcode -input=false -no-color $LABEL_TARGETS -var='label_round_trip={}'
+    assert_success
+}

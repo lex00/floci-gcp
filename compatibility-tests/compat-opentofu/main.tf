@@ -464,3 +464,39 @@ resource "google_compute_instance" "compat" {
     }
   }
 }
+
+# ── Label round trip ─────────────────────────────────────────────────────────
+# One label map drives a bucket, a topic and a subscription, so the tests can
+# change a single label and then clear them all.
+
+variable "label_round_trip" {
+  type = map(string)
+  default = {
+    env  = "compat"
+    team = "data"
+  }
+}
+
+resource "google_storage_bucket" "labels" {
+  name          = "floci-compat-labels-tofu"
+  location      = "US"
+  force_destroy = true
+  labels        = var.label_round_trip
+}
+
+resource "google_storage_bucket_iam_member" "labels_viewer" {
+  bucket = google_storage_bucket.labels.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.compat.email}"
+}
+
+resource "google_pubsub_topic" "labels" {
+  name   = "floci-compat-labels-tofu"
+  labels = var.label_round_trip
+}
+
+resource "google_pubsub_subscription" "labels" {
+  name   = "floci-compat-labels-sub-tofu"
+  topic  = google_pubsub_topic.labels.id
+  labels = var.label_round_trip
+}

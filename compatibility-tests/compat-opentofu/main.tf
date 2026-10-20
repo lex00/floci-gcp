@@ -500,3 +500,29 @@ resource "google_pubsub_subscription" "labels" {
   topic  = google_pubsub_topic.labels.id
   labels = var.label_round_trip
 }
+
+# ── Resource Manager tags ────────────────────────────────────────────────────
+
+data "google_project" "current" {}
+
+resource "google_tags_tag_key" "compat" {
+  parent      = "projects/${var.project}"
+  short_name  = "floci-compat-fence-tofu"
+  description = "compat tag key"
+}
+
+resource "google_tags_tag_value" "compat" {
+  parent     = google_tags_tag_key.compat.id
+  short_name = "estate-a"
+}
+
+resource "google_tags_tag_binding" "project" {
+  parent    = "//cloudresourcemanager.googleapis.com/projects/${data.google_project.current.number}"
+  tag_value = google_tags_tag_value.compat.id
+}
+
+resource "google_tags_location_tag_binding" "bucket" {
+  parent    = "//storage.googleapis.com/projects/_/buckets/${google_storage_bucket.compat.name}"
+  tag_value = google_tags_tag_value.compat.id
+  location  = "us"
+}

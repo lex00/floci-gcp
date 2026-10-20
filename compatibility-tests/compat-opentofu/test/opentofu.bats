@@ -595,3 +595,26 @@ label_urls() {
     run tofu plan -detailed-exitcode -input=false -no-color $LABEL_TARGETS -var='label_round_trip={}'
     assert_success
 }
+
+# ── Resource Manager Tags ─────────────────────────────────────────────────────
+
+@test "OpenTofu: tag key and value resolve by namespaced name" {
+    run gcp_curl "${FLOCI_ENDPOINT}/v3/tagKeys/namespaced?name=${FLOCI_PROJECT}/floci-compat-fence-tofu"
+    assert_success
+    assert_output --partial '"description":"compat tag key"'
+    run gcp_curl "${FLOCI_ENDPOINT}/v3/tagValues/namespaced?name=${FLOCI_PROJECT}/floci-compat-fence-tofu/estate-a"
+    assert_success
+}
+
+@test "OpenTofu: project and bucket carry the tag binding" {
+    number=$(gcp_curl "${FLOCI_ENDPOINT}/v1/projects/${FLOCI_PROJECT}" | jq -r .projectNumber)
+    result=$(gcp_curl -G "${FLOCI_ENDPOINT}/v3/tagBindings" --data-urlencode "parent=//cloudresourcemanager.googleapis.com/projects/${number}")
+    [[ "$result" == *'"tagValueNamespacedName":"'"${FLOCI_PROJECT}"'/floci-compat-fence-tofu/estate-a"'* ]]
+    result=$(gcp_curl -G "${FLOCI_ENDPOINT}/v3/tagBindings" --data-urlencode "parent=//storage.googleapis.com/projects/_/buckets/floci-compat-bucket-tofu")
+    [[ "$result" == *'floci-compat-fence-tofu/estate-a'* ]]
+}
+
+@test "OpenTofu: tag resources plan clean after apply" {
+    run tofu plan -detailed-exitcode -input=false -no-color -target=google_tags_tag_binding.project -target=google_tags_location_tag_binding.bucket
+    assert_success
+}

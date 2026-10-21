@@ -12,6 +12,10 @@ name: GHCR Publish
 # Published tags:
 #   develop push: ghcr.io/lex00/floci-gcp:latest   ghcr.io/lex00/floci-gcp:<short-sha>
 #   tag push:   ghcr.io/lex00/floci-gcp:<tag>    ghcr.io/lex00/floci-gcp:<short-sha>
+#
+# Fast publish: run it from the Actions tab (or `gh workflow run ghcr-publish.yml
+# --ref develop`) with skip_tests, or push a develop commit whose message
+# contains [skip tests]. Either skips the test gate and builds straight away.
 
 on:
   push:
@@ -19,6 +23,12 @@ on:
       - develop
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: Skip the test gate
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -32,7 +42,7 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/floci-gcp
 
 jobs:
-  # Gate: the build/merge jobs below do not run unless the suite is green.
+  # Gate: the build/merge jobs below run only when the suite is green or skipped (see Fast publish above).
   #
   # Duplicates ci.yml's test step (one unsharded `mvn test`) rather than chaining
   # on CI via workflow_run: ci.yml has no `tags:` trigger and is path-filtered, so
@@ -41,6 +51,7 @@ jobs:
   # to main that touches src/, accepted for a low-traffic fork.
   test:
     name: Test suite (publish gate)
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_tests) && !contains(github.event.head_commit.message, '[skip tests]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -65,6 +76,7 @@ jobs:
   build:
     name: build ${{ matrix.platform }}
     needs: test
+    if: ${{ !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:

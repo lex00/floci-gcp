@@ -60,6 +60,7 @@ public class CloudRunService {
 
     private static final Logger LOG = Logger.getLogger(CloudRunService.class);
     private static final String WILDCARD = "-";
+    private static final String USER_MANAGED_ACCOUNT_DOMAIN = ".iam.gserviceaccount.com";
 
     private final StorageBackend<String, String> serviceStore;
     private final StorageBackend<String, String> revisionStore;
@@ -191,6 +192,7 @@ public class CloudRunService {
         if (instanceExists.test(parent + "/instances/" + id)) {
             throw GcpException.alreadyExists("Resource '" + id + "' already exists.");
         }
+        requireServiceAccount(requested.getTemplate().getServiceAccount());
 
         Timestamp now = timestampNow();
         String revisionName = name + "/revisions/" + id + "-00001";
@@ -230,6 +232,26 @@ public class CloudRunService {
                 () -> failRuntimeStart(guard, storedService, storedRevision,
                         "Cloud Run operation timed out", Code.DEADLINE_EXCEEDED_VALUE));
         return operation;
+    }
+
+    /**
+     * Refuses a user-managed service account that IAM does not hold. The default compute account
+     * and Google-managed accounts live outside floci's IAM store and are not checked.
+     */
+    private void requireServiceAccount(String email) {
+        int at = email.indexOf('@');
+        if (iamService == null || at < 0 || !email.endsWith(USER_MANAGED_ACCOUNT_DOMAIN)) {
+            return;
+        }
+        String project = email.substring(at + 1, email.length() - USER_MANAGED_ACCOUNT_DOMAIN.length());
+        try {
+            iamService.getServiceAccount(project, email);
+        } catch (GcpException e) {
+            if (e.getHttpStatus() == 404) {
+                throw GcpException.invalidArgument("Service account " + email + " does not exist");
+            }
+            throw e;
+        }
     }
 
     private void requireListLocation(String location) {
@@ -302,6 +324,10 @@ public class CloudRunService {
         Timestamp now = timestampNow();
         String revisionName = templateChanged ? nextRevisionName(name, existing) : existing.getLatestCreatedRevision();
         com.google.cloud.run.v2.Service updated = applyServiceUpdate(existing, requested, mask, revisionName, now);
+        String serviceAccount = updated.getTemplate().getServiceAccount();
+        if (!serviceAccount.equals(existing.getTemplate().getServiceAccount())) {
+            requireServiceAccount(serviceAccount);
+        }
         Revision revision = null;
 
         if (templateChanged) {

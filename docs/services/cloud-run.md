@@ -73,6 +73,8 @@ The invocation proxy accepts both generated host-routed URLs and the legacy pref
 
 Service create, and an update that changes `template.serviceAccount`, fail with `400 INVALID_ARGUMENT` and `Service account {email} does not exist` when a `*.iam.gserviceaccount.com` account is missing from the IAM emulator. Other accounts, such as the default compute account, are stored as given.
 
+Service create, and an update that changes `template.vpcAccess`, check each Direct VPC egress network interface against the Compute networks and subnetworks the emulator holds. A `network` or `subnetwork` may be a name, a partial URL or a full URL. Without a `subnetwork`, the subnetwork named like the network is used. A missing network or subnetwork, a subnetwork outside the service's region, or a subnetwork in another network fails with `400 INVALID_ARGUMENT`. With Compute disabled, the interfaces are stored as given.
+
 `validateOnly=true` returns a successful completed operation without storing or deleting resources. Validate-only operations are not retained for later operation get/list calls.
 
 Deleting a service revision that is the service's `latestReadyRevision` or is named in its `trafficStatuses` fails with `400 FAILED_PRECONDITION` and `Revision "{revision}" cannot be directly deleted because it is actively serving.`. Other revisions are removed and the completed operation returns the revision with `deleteTime` and `expireTime` set. Runtime containers are not touched by revision delete; retired service revisions have no running container.

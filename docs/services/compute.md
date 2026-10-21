@@ -102,7 +102,12 @@ emulated.
 
 ## Global external application load balancer
 
-Zonal GCE_VM_IP_PORT endpoint groups support endpoint attach/detach/list. Global
+Network endpoint groups support endpoint attach/detach/list at three scopes:
+zonal `GCE_VM_IP_PORT` (instance endpoints) and `NON_GCP_PRIVATE_IP_PORT`
+(`ipAddress` and `port`, with a required `network`), and global and regional
+`INTERNET_IP_PORT` (`ipAddress`) and `INTERNET_FQDN_PORT` (`fqdn`). An endpoint
+without `port` takes the group's `defaultPort`. A backend service whose backends are
+internet NEGs takes no health check. Global
 HTTP health checks, EXTERNAL_MANAGED backend services, URL maps, HTTP target proxies
 and TCP forwarding rules support configuration and ordered cleanup. Backend and
 URL-map updates require current fingerprints. Path matchers, host rules, pathRules

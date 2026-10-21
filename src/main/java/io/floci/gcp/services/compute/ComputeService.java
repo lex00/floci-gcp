@@ -15,6 +15,7 @@ import io.floci.gcp.services.compute.model.ComputeOperation;
 import io.floci.gcp.services.compute.model.ComputeProject;
 import io.quarkus.runtime.StartupEvent;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Event;
 import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -36,15 +37,21 @@ public class ComputeService {
     private final ServiceRegistry registry;
     private final Instance<ComputeResourceHandler> handlers;
     private final LocationCatalog locations;
+    private final Event<ForwardingRulesChanged> forwardingRulesChanged;
+
+    /** Fired after a mutation of a project's forwarding rules has been saved. */
+    public record ForwardingRulesChanged(String project) {}
 
     @Inject
     public ComputeService(StorageFactory factory, EmulatorConfig config, ServiceRegistry registry,
-                          Instance<ComputeResourceHandler> handlers, LocationCatalog locations) {
+                          Instance<ComputeResourceHandler> handlers, LocationCatalog locations,
+                          Event<ForwardingRulesChanged> forwardingRulesChanged) {
         this.store = (ProjectAwareStorageBackend<ComputeProject>) factory.<ComputeProject>create("compute", "compute.json", new TypeReference<Map<String, ComputeProject>>() {});
         this.config = config;
         this.registry = registry;
         this.handlers = handlers;
         this.locations = locations;
+        this.forwardingRulesChanged = forwardingRulesChanged;
     }
     void start(@Observes StartupEvent event) {
         config.services().compute().regions().ifPresent(allowed -> allowed.stream()
@@ -136,6 +143,15 @@ public class ComputeService {
     /** A snapshot of the project's resources, keyed by their path under the project. */
     public synchronized Map<String, ObjectNode> resources(String project) {
         return Map.copyOf(state(project).resources);
+    }
+    /** Copies of every project's global forwarding rules. */
+    public synchronized List<ObjectNode> globalForwardingRules() {
+        return store.scanAllProjects("state"::equals).stream()
+                .map(stored -> JSON.convertValue(stored, ComputeProject.class))
+                .flatMap(state -> state.resources.entrySet().stream())
+                .filter(e -> e.getKey().startsWith("global/forwardingRules/"))
+                .map(e -> e.getValue().deepCopy())
+                .toList();
     }
     public synchronized ObjectNode get(String project, String path, Map<String, String> query) {
         Context c = context(project, path, state(project));
@@ -283,6 +299,7 @@ public class ComputeService {
         if (requestId != null) { op.response.put("clientOperationId", requestId); c.state.requests.put(requestKey, operationKey); }
         c.state.operations.put(operationKey, op);
         save(project, c.state);
+        if (c.collection().equals("forwardingRules")) { forwardingRulesChanged.fire(new ForwardingRulesChanged(project)); }
         return op.response.deepCopy();
     }
     private ComputeOperation operation(Context c) {

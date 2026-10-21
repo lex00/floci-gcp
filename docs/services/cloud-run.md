@@ -71,6 +71,8 @@ Execution-backed create, template-changing update, and delete run on a bounded b
 
 The invocation proxy accepts both generated host-routed URLs and the legacy prefixed path `/run/v2/projects/{project}/locations/{location}/services/{service}` for compatibility. Host-routed requests preserve the original app path and query string, so `GET $uri/api/database?x=1` reaches the container as `/api/database?x=1`. The proxy forwards HTTP methods, trailing paths, query strings, request bodies, safe headers, and `X-Forwarded-*` headers to the latest ready revision. Missing services return `404`, services without a ready runtime return `503`, runtime connection failures return `502`, and proxy timeouts return `504`.
 
+Service create, and an update that changes `template.serviceAccount`, fail with `400 INVALID_ARGUMENT` and `Service account {email} does not exist` when a `*.iam.gserviceaccount.com` account is missing from the IAM emulator. Other accounts, such as the default compute account, are stored as given.
+
 `validateOnly=true` returns a successful completed operation without storing or deleting resources. Validate-only operations are not retained for later operation get/list calls.
 
 Deleting a service revision that is the service's `latestReadyRevision` or is named in its `trafficStatuses` fails with `400 FAILED_PRECONDITION` and `Revision "{revision}" cannot be directly deleted because it is actively serving.`. Other revisions are removed and the completed operation returns the revision with `deleteTime` and `expireTime` set. Runtime containers are not touched by revision delete; retired service revisions have no running container.

@@ -21,6 +21,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -118,7 +119,7 @@ public class IamController {
 
     // hashicorp/google sends snake_case paths ("display_name"); the API also accepts camelCase.
     private static Set<String> parseUpdateMask(String mask) {
-        Set<String> fields = new java.util.HashSet<>();
+        Set<String> fields = new HashSet<>();
         for (String path : mask.split(",")) {
             String field = path.trim();
             if (field.startsWith("serviceAccount.")) {

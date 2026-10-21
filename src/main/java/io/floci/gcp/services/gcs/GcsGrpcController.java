@@ -204,7 +204,7 @@ public class GcsGrpcController extends StorageGrpc.StorageImplBase {
                 service.deleteObjectVersion(bucket, request.getObject(),
                         Long.toString(request.getGeneration()), conditions);
             } else if (!service.deleteObject(bucket, request.getObject(), conditions)) {
-                throw GcpException.notFound("Object not found: " + request.getObject());
+                throw service.objectNotFound(bucket, request.getObject());
             }
             return Empty.getDefaultInstance();
         });

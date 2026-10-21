@@ -423,7 +423,7 @@ public class GcsObjectController {
             return Response.noContent().build();
         }
         if (!service.deleteObject(bucket, objectPath, preconditions)) {
-            throw GcpException.notFound("Object not found: " + objectPath);
+            throw service.objectNotFound(bucket, objectPath);
         }
         return Response.noContent().build();
     }

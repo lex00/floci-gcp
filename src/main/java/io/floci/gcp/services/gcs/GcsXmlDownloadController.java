@@ -149,7 +149,7 @@ public class GcsXmlDownloadController {
         if (generation != null && !generation.isBlank()) {
             service.deleteObjectVersion(bucket, objectPath, generation);
         } else if (!service.deleteObject(bucket, objectPath)) {
-            throw io.floci.gcp.core.common.GcpException.notFound("Object not found: " + objectPath);
+            throw service.objectNotFound(bucket, objectPath);
         }
         return Response.noContent().build();
     }

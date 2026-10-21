@@ -331,11 +331,23 @@ public class GcsService {
         }
     }
 
+    /** The JSON and XML APIs' answer to any request naming a bucket that does not exist. */
+    public static GcpException bucketNotFound() {
+        return GcpException.notFound("The specified bucket does not exist.");
+    }
+
+    /** A missing object's 404, which names the bucket instead when the bucket itself is missing. */
+    public GcpException objectNotFound(String bucket, String objectName) {
+        return bucketStore.get(bucket).isPresent()
+                ? GcpException.notFound("Object not found: " + objectName)
+                : bucketNotFound();
+    }
+
     public GcsBucket getBucket(String name) {
         LOG.debugf("getBucket name=%s", name);
         return bucketStore.get(name)
                 .map(this::withProjectDefaults)
-                .orElseThrow(() -> GcpException.notFound("Bucket not found: " + name));
+                .orElseThrow(() -> bucketNotFound());
     }
 
     // Buckets persisted before projectId was stored belong to the default project.
@@ -588,7 +600,7 @@ public class GcsService {
         return withMultipartBucketLock(name, () -> {
             if (bucketStore.get(name).isEmpty()) {
                 LOG.warnf("deleteBucket failed: bucket not found name=%s", name);
-                throw GcpException.notFound("Bucket not found: " + name);
+                throw bucketNotFound();
             }
             if (hasLiveOrVersionedObjects(name)) {
                 return false;
@@ -721,7 +733,7 @@ public class GcsService {
         GcsBucket b = bucketStore.get(bucket).orElse(null);
         if (b == null) {
             LOG.warnf("putObject failed: bucket not found bucket=%s", bucket);
-            throw GcpException.notFound("Bucket not found: " + bucket);
+            throw bucketNotFound();
         }
         String key = objectKey(bucket, objectName);
         String now = nowTimestamp();
@@ -845,7 +857,7 @@ public class GcsService {
     public GcsObjectMeta getObjectMeta(String bucket, String objectName) {
         LOG.debugf("getObjectMeta bucket=%s name=%s", bucket, objectName);
         GcsObjectMeta meta = getLiveObjectMeta(bucket, objectName)
-                .orElseThrow(() -> GcpException.notFound("Object not found: " + objectName));
+                .orElseThrow(() -> objectNotFound(bucket, objectName));
         return meta;
     }
 
@@ -855,7 +867,7 @@ public class GcsService {
         GcsObjectMeta live = objectMetaStore.get(liveKey).orElse(null);
         if (live != null && generation.equals(live.getGeneration())) {
             if (!isReadableLiveObject(liveKey, live)) {
-                throw GcpException.notFound("Object not found: " + objectName);
+                throw objectNotFound(bucket, objectName);
             }
             return live;
         }
@@ -869,12 +881,12 @@ public class GcsService {
         LOG.debugf("getObjectData bucket=%s name=%s", bucket, objectName);
         String key = objectKey(bucket, objectName);
         GcsObjectMeta meta = getLiveObjectMeta(bucket, objectName)
-                .orElseThrow(() -> GcpException.notFound("Object not found: " + objectName));
+                .orElseThrow(() -> objectNotFound(bucket, objectName));
         checkCustomerEncryption(meta, customerEncryption);
         byte[] data = objectDataStore.get(key).orElse(null);
         if (data == null) {
             LOG.warnf("getObjectData failed: object not found bucket=%s name=%s", bucket, objectName);
-            throw GcpException.notFound("Object not found: " + objectName);
+            throw objectNotFound(bucket, objectName);
         }
         return data;
     }
@@ -890,7 +902,7 @@ public class GcsService {
         GcsObjectMeta live = objectMetaStore.get(liveKey).orElse(null);
         if (live != null && generation.equals(live.getGeneration())) {
             if (!isReadableLiveObject(liveKey, live)) {
-                throw GcpException.notFound("Object not found: " + objectName);
+                throw objectNotFound(bucket, objectName);
             }
             checkCustomerEncryption(live, customerEncryption);
             byte[] data = objectDataStore.get(liveKey).orElse(null);
@@ -1374,7 +1386,7 @@ public class GcsService {
         LOG.debugf("patchObject bucket=%s name=%s", bucket, objectName);
         String key = objectKey(bucket, objectName);
         GcsObjectMeta meta = getLiveObjectMeta(bucket, objectName)
-                .orElseThrow(() -> GcpException.notFound("Object not found: " + objectName));
+                .orElseThrow(() -> objectNotFound(bucket, objectName));
         Map<String, Object> patch = objectPatch.fields();
 
         // GCS never removes a custom time, so a null here leaves the field alone.
@@ -1473,7 +1485,7 @@ public class GcsService {
                     "compose accepts at most " + MAX_COMPOSE_SOURCES + " source objects, got " + sources.size());
         }
         if (bucketStore.get(bucket).isEmpty()) {
-            throw GcpException.notFound("Bucket not found: " + bucket);
+            throw bucketNotFound();
         }
         byte[] composed = new byte[0];
         GcsObjectMeta firstSourceMeta = null;
@@ -1516,6 +1528,10 @@ public class GcsService {
 
     private void checkPreconditions(String bucket, String objectName,
             GcsObjectPreconditions preconditions) {
+        // GCS answers a missing bucket before it evaluates any precondition.
+        if (!preconditions.isEmpty() && bucketStore.get(bucket).isEmpty()) {
+            throw bucketNotFound();
+        }
         checkPreconditions(getLiveObjectMeta(bucket, objectName), preconditions);
     }
 
@@ -1788,7 +1804,7 @@ public class GcsService {
         LOG.debugf("listObjects bucket=%s", bucket);
         if (bucketStore.get(bucket).isEmpty()) {
             LOG.warnf("listObjects failed: bucket not found bucket=%s", bucket);
-            throw GcpException.notFound("Bucket not found: " + bucket);
+            throw bucketNotFound();
         }
         String prefix = bucket + "\0";
         List<GcsObjectMeta> objects = new ArrayList<>();
@@ -1808,7 +1824,7 @@ public class GcsService {
     public List<GcsObjectMeta> listObjectVersions(String bucket, String prefix) {
         LOG.debugf("listObjectVersions bucket=%s prefix=%s", bucket, prefix);
         if (bucketStore.get(bucket).isEmpty()) {
-            throw GcpException.notFound("Bucket not found: " + bucket);
+            throw bucketNotFound();
         }
         String bucketPrefix = bucket + "\0";
         List<GcsObjectMeta> result = objectMetaStore.keys().stream()
@@ -1908,7 +1924,7 @@ public class GcsService {
     public String startStreamingUpload(GcsObjectMeta object, GcsObjectPreconditions preconditions,
             Long expectedSize, Integer expectedCrc32c, byte[] expectedMd5) {
         if (bucketStore.get(object.getBucket()).isEmpty()) {
-            throw GcpException.notFound("Bucket not found: " + object.getBucket());
+            throw bucketNotFound();
         }
         String uploadId = UUID.randomUUID().toString();
         streamingUploads.put(uploadId, new GcsStreamingUpload(
@@ -2048,7 +2064,7 @@ public class GcsService {
         GcsBucket bucketInstance = bucketStore.get(bucket).orElse(null);
         if (bucketInstance == null) {
             LOG.warnf("startResumableUpload failed: bucket not found bucket=%s", bucket);
-            throw GcpException.notFound("Bucket not found: " + bucket);
+            throw bucketNotFound();
         }
         String uploadId = UUID.randomUUID().toString();
         resumableUploads.put(uploadId, new ResumableUpload(bucket, objectName, contentType,

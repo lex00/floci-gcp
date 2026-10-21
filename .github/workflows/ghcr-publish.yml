@@ -132,6 +132,7 @@ jobs:
   merge:
     name: merge manifest
     needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download digests

@@ -8,13 +8,16 @@ import io.floci.gcp.services.cloudrun.CloudRunService;
 import io.floci.gcp.services.cloudrun.model.CloudRunRuntimeInstance;
 import io.quarkus.runtime.ShutdownEvent;
 import io.quarkus.vertx.http.HttpServerStart;
+import io.vertx.core.Future;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
+import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.HostAndPort;
+import io.vertx.core.net.PemKeyCertOptions;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.event.Observes;
 import jakarta.enterprise.event.ObservesAsync;
@@ -28,6 +31,7 @@ import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -35,12 +39,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.TreeSet;
+import java.util.TreeMap;
 
 /**
  * Serves global external Application Load Balancers. Each single-port forwarding rule's port is
- * opened in the emulator, and a request on it follows the target HTTP proxy, URL map and backend
- * service to the Cloud Run service of a serverless NEG.
+ * opened in the emulator, with TLS from the SSL certificates of a target HTTPS proxy. A request on
+ * it follows the target proxy, URL map and backend service, passes the backend service's Cloud
+ * Armor policy, and reaches the Cloud Run service of a serverless NEG.
  */
 @ApplicationScoped
 public class ComputeLoadBalancerDataPlane {
@@ -53,7 +58,17 @@ public class ComputeLoadBalancerDataPlane {
     private final EmulatorConfig config;
     private final Vertx vertx;
     private final HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build();
-    private final Map<Integer, HttpServer> listeners = new HashMap<>();
+    private final Map<Integer, Listener> listeners = new HashMap<>();
+    // Vert.x shares a bound port between its servers, so a port reopens only once its old server has closed.
+    private final Map<Integer, Future<Void>> closing = new HashMap<>();
+
+    private record Listener(HttpServer server, String signature) {}
+
+    /** What a port serves: plain HTTP, or TLS with PEM certificate and key pairs. */
+    private record Spec(List<String> certificates, List<String> keys) {
+        boolean tls() { return !certificates.isEmpty(); }
+        String signature() { return String.join("\n", certificates); }
+    }
 
     record Reply(int status, Map<String, List<String>> headers, byte[] body) {
         static Reply text(int status, String message) {
@@ -83,7 +98,7 @@ public class ComputeLoadBalancerDataPlane {
     }
 
     synchronized void stop(@Observes ShutdownEvent event) {
-        listeners.values().forEach(HttpServer::close);
+        listeners.values().stream().filter(listener -> listener.server() != null).forEach(listener -> listener.server().close());
         listeners.clear();
     }
 
@@ -91,38 +106,87 @@ public class ComputeLoadBalancerDataPlane {
         if (!config.services().compute().enabled()) {
             return;
         }
-        Set<Integer> ports = new TreeSet<>();
-        for (ObjectNode rule : compute.globalForwardingRules()) {
+        Map<Integer, Spec> specs = new HashMap<>();
+        List<ObjectNode> rules = compute.globalForwardingRules().stream()
+                .sorted(Comparator.comparing((ObjectNode r) -> r.path("creationTimestamp").asText())).toList();
+        for (ObjectNode rule : rules) {
             int port = listenerPort(rule);
             if (port == config.port()) {
                 LOG.warnf("Forwarding rule %s shares the emulator port %d and is not served", rule.path("name").asText(), port);
-            } else if (port > 0) {
-                ports.add(port);
+            } else if (port > 0 && !specs.containsKey(port)) {
+                specs.put(port, spec(rule));
             }
         }
         listeners.entrySet().removeIf(entry -> {
-            if (ports.contains(entry.getKey())) {
+            Spec spec = specs.get(entry.getKey());
+            if (spec != null && spec.signature().equals(entry.getValue().signature())) {
                 return false;
             }
-            entry.getValue().close();
-            LOG.infof("Load balancer listener on port %d closed", entry.getKey());
+            // A listener still waiting to open has no server; its pending open sees the change and skips.
+            if (entry.getValue().server() != null) {
+                closing.put(entry.getKey(), entry.getValue().server().close());
+                LOG.infof("Load balancer listener on port %d closed", entry.getKey());
+            }
             return true;
         });
-        for (int port : ports) {
-            if (listeners.containsKey(port)) {
-                continue;
+        for (Map.Entry<Integer, Spec> entry : new TreeMap<>(specs).entrySet()) {
+            int port = entry.getKey();
+            if (!listeners.containsKey(port)) {
+                Future<Void> closed = closing.getOrDefault(port, Future.succeededFuture());
+                Spec spec = entry.getValue();
+                listeners.put(port, new Listener(null, spec.signature()));
+                closed.onComplete(done -> open(port, spec));
             }
-            HttpServer server = vertx.createHttpServer().requestHandler(request -> handle(port, request));
-            listeners.put(port, server);
-            server.listen(port, "0.0.0.0")
-                    .onSuccess(s -> LOG.infof("Load balancer listener on port %d opened", port))
-                    .onFailure(e -> {
-                        LOG.warnf("Load balancer listener on port %d failed to open: %s", port, e.getMessage());
-                        synchronized (this) {
-                            listeners.remove(port, server);
-                        }
-                    });
         }
+    }
+
+    private synchronized void open(int port, Spec spec) {
+        Listener reserved = listeners.get(port);
+        if (reserved == null || reserved.server() != null || !reserved.signature().equals(spec.signature())) {
+            return;
+        }
+        HttpServerOptions options = new HttpServerOptions();
+        if (spec.tls()) {
+            PemKeyCertOptions pem = new PemKeyCertOptions();
+            for (int i = 0; i < spec.certificates().size(); i++) {
+                pem.addCertValue(Buffer.buffer(spec.certificates().get(i))).addKeyValue(Buffer.buffer(spec.keys().get(i)));
+            }
+            options.setSsl(true).setSni(spec.certificates().size() > 1).setKeyCertOptions(pem);
+        }
+        HttpServer server = vertx.createHttpServer(options).requestHandler(request -> handle(port, request));
+        listeners.put(port, new Listener(server, spec.signature()));
+        server.listen(port, "0.0.0.0")
+                .onSuccess(s -> LOG.infof("Load balancer listener on port %d opened (%s)", port, spec.tls() ? "HTTPS" : "HTTP"))
+                .onFailure(e -> {
+                    LOG.warnf("Load balancer listener on port %d failed to open: %s", port, e.getMessage());
+                    synchronized (this) {
+                        Listener current = listeners.get(port);
+                        if (current != null && current.server() == server) {
+                            listeners.remove(port);
+                        }
+                    }
+                });
+    }
+
+    private Spec spec(ObjectNode rule) {
+        List<String> certificates = new ArrayList<>(), keys = new ArrayList<>();
+        String target = rule.path("target").asText();
+        if (target.contains("/targetHttpsProxies/")) {
+            String project = project(rule.path("selfLink").asText());
+            Map<String, ObjectNode> resources = compute.resources(project);
+            ObjectNode proxy = resolve(resources, project, target);
+            for (JsonNode link : proxy == null ? List.<JsonNode>of() : proxy.path("sslCertificates")) {
+                ObjectNode certificate = resolve(resources, project, link.asText());
+                if (certificate != null && certificate.hasNonNull("certificate") && certificate.hasNonNull("privateKey")) {
+                    certificates.add(certificate.path("certificate").asText());
+                    keys.add(certificate.path("privateKey").asText());
+                }
+            }
+            if (certificates.isEmpty()) {
+                LOG.warnf("Forwarding rule %s targets an HTTPS proxy with no usable certificate", rule.path("name").asText());
+            }
+        }
+        return new Spec(certificates, keys);
     }
 
     synchronized boolean listening(int port) {
@@ -150,8 +214,9 @@ public class ComputeLoadBalancerDataPlane {
         String uri = request.uri();
         MultiMap headers = request.headers();
         String client = request.remoteAddress() == null ? null : request.remoteAddress().host();
+        boolean tls = request.isSSL();
         request.body()
-                .compose(body -> vertx.executeBlocking(() -> route(port, host, method, uri, headers, body.getBytes(), client), false))
+                .compose(body -> vertx.executeBlocking(() -> route(port, tls, host, method, uri, headers, body.getBytes(), client), false))
                 .onSuccess(reply -> send(request, reply))
                 .onFailure(e -> {
                     LOG.warnf(e, "Load balancer request on port %d failed", port);
@@ -159,7 +224,7 @@ public class ComputeLoadBalancerDataPlane {
                 });
     }
 
-    Reply route(int port, String host, String method, String uri, MultiMap headers, byte[] body, String clientIp) {
+    Reply route(int port, boolean tls, String host, String method, String uri, MultiMap headers, byte[] body, String clientIp) {
         String hostName = hostName(host);
         List<ObjectNode> rules = compute.globalForwardingRules().stream()
                 .filter(r -> listenerPort(r) == port)
@@ -182,6 +247,11 @@ public class ComputeLoadBalancerDataPlane {
         if (backendService == null) {
             return Reply.text(502, "URL map " + urlMap.path("name").asText() + " routes to no backend service");
         }
+        ObjectNode policy = resolve(resources, project, backendService.path("securityPolicy").asText());
+        int denied = policy == null ? 0 : denial(policy, clientIp);
+        if (denied > 0) {
+            return Reply.text(denied, "Denied by security policy " + policy.path("name").asText());
+        }
         for (JsonNode backend : backendService.path("backends")) {
             ObjectNode group = resolve(resources, project, backend.path("group").asText());
             if (group == null || !group.path("networkEndpointType").asText().equals("SERVERLESS")
@@ -193,7 +263,7 @@ public class ComputeLoadBalancerDataPlane {
                     + "/services/" + group.path("cloudRun").path("service").asText();
             Optional<CloudRunRuntimeInstance> runtime = readyRuntime(serviceName);
             if (runtime.isPresent()) {
-                return forward(runtime.get(), method, uri, headers, body, host, clientIp);
+                return forward(runtime.get(), tls, method, uri, headers, body, host, clientIp);
             }
         }
         return Reply.text(503, "Backend service " + backendService.path("name").asText() + " has no ready Cloud Run backend");
@@ -208,7 +278,20 @@ public class ComputeLoadBalancerDataPlane {
         }
     }
 
-    private Reply forward(CloudRunRuntimeInstance runtime, String method, String uri, MultiMap headers, byte[] body,
+    /** The status a policy's first matching rule denies with, or 0 when it allows the client. */
+    static int denial(JsonNode policy, String clientIp) {
+        for (JsonNode rule : policy.path("rules")) {
+            if (rule.path("preview").asBoolean(false)
+                    || !ComputeSecurityResources.matches(rule.path("match").path("config").path("srcIpRanges"), clientIp)) {
+                continue;
+            }
+            String action = rule.path("action").asText();
+            return action.startsWith("deny(") ? Integer.parseInt(action.substring(5, action.length() - 1)) : 0;
+        }
+        return 0;
+    }
+
+    private Reply forward(CloudRunRuntimeInstance runtime, boolean tls, String method, String uri, MultiMap headers, byte[] body,
                           String host, String clientIp) {
         HttpRequest.Builder builder = HttpRequest.newBuilder(URI.create(runtime.endpointUri(uri)))
                 .version(runtime.ingressH2c() ? HttpClient.Version.HTTP_2 : HttpClient.Version.HTTP_1_1)
@@ -226,7 +309,7 @@ public class ComputeLoadBalancerDataPlane {
         if (clientIp != null) {
             builder.header("X-Forwarded-For", forwardedFor == null ? clientIp : forwardedFor + ", " + clientIp);
         }
-        builder.header("X-Forwarded-Proto", "http");
+        builder.header("X-Forwarded-Proto", tls ? "https" : "http");
         if (host != null) {
             builder.header("X-Forwarded-Host", host);
         }

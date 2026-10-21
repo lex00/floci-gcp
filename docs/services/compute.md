@@ -116,19 +116,41 @@ fingerprints. Path matchers, host rules, pathRules and session-affinity
 configuration are validated. Endpoint membership is stored separately from the
 public NEG resource.
 
+### TLS and Cloud Armor
+
+`global/sslCertificates` take `SELF_MANAGED` certificates (`certificate` and
+`privateKey` in PEM; `privateKey` is never returned) and `MANAGED` ones
+(`managed.domains`). A managed certificate is issued at once as a self-signed
+certificate for its domains, with `managed.status` and every domain `ACTIVE`.
+`targetHttpsProxies` take a `urlMap` and 1 to 15 `sslCertificates`, and support
+`setUrlMap` and `setSslCertificates`. A forwarding rule may target an HTTP or an
+HTTPS proxy.
+
+`global/securityPolicies` of type `CLOUD_ARMOR` hold rules that match
+`match.config.srcIpRanges` (`versionedExpr: SRC_IPS_V1`) with action `allow`,
+`deny(403)`, `deny(404)` or `deny(502)`. A policy without a rule at priority
+2147483647 gets a default `allow` rule for `*`, which cannot be removed. Policies
+support `addRule`, `patchRule`, `removeRule` and `getRule` (`?priority=`, default 0),
+and patching takes the current `fingerprint`. A backend service names one in
+`securityPolicy` or through `setSecurityPolicy`. CEL `expr` matches, rate limiting,
+redirects and adaptive protection are not implemented.
+
 ### Request routing
 
 floci-gcp opens the port of each forwarding rule whose `portRange` names a single
-port, on all interfaces of the emulator, and serves plain HTTP on it. A request
-follows the target HTTP proxy and the URL map (host rules, then the longest
-matching path rule, then the default service) to a backend service, and is proxied
+port, on all interfaces of the emulator. It serves plain HTTP for a target HTTP
+proxy, and TLS with the proxy's certificates (SNI picks among several) for a target
+HTTPS proxy. A request follows the target proxy and the URL map (host rules, then the longest
+matching path rule, then the default service) to a backend service. When the backend service has a security policy, the first
+rule by priority whose `srcIpRanges` match the client address (rules in `preview`
+are skipped) allows the request or answers its deny status. An allowed request is proxied
 to the container of the first serverless NEG backend whose `cloudRun.service` has
 a ready revision. Requests get `X-Forwarded-For`, `X-Forwarded-Proto`,
 `X-Forwarded-Host` and `Via: 1.1 google`. Ports open and close as forwarding rules
 are created and deleted, and reopen on restart from stored rules. In Docker,
 publish the rule's port on the emulator container. When several rules share a
 port, the one whose `IPAddress` matches the request host serves it, otherwise the
-oldest. A rule on the emulator's own port is not served. Health checks, TLS,
+oldest. A rule on the emulator's own port is not served. Health checks,
 `cloudRun.urlMask`, `tag`, App Engine and Cloud Functions backends, internet and VM
 NEG backends, regional load balancing and advanced routeRules are not served.
 

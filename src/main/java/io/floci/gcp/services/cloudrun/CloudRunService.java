@@ -1,10 +1,12 @@
 package io.floci.gcp.services.cloudrun;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.google.cloud.run.v2.Condition;
 import com.google.cloud.run.v2.ListRevisionsResponse;
 import com.google.cloud.run.v2.ListServicesResponse;
 import com.google.cloud.run.v2.Revision;
+import com.google.cloud.run.v2.RevisionTemplate;
 import com.google.cloud.run.v2.Service;
 import com.google.cloud.run.v2.TrafficTarget;
 import com.google.cloud.run.v2.TrafficTargetAllocationType;
@@ -27,6 +29,7 @@ import io.floci.gcp.core.common.ServiceRegistry;
 import io.floci.gcp.core.storage.StorageBackend;
 import io.floci.gcp.core.storage.StorageFactory;
 import io.floci.gcp.services.cloudrun.model.CloudRunRuntimeInstance;
+import io.floci.gcp.services.compute.ComputeService;
 import io.floci.gcp.services.iam.IamPolicyCodec;
 import io.floci.gcp.services.iam.IamService;
 import io.floci.gcp.services.iam.model.StoredPolicy;
@@ -47,6 +50,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Function;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -72,6 +76,8 @@ public class CloudRunService {
     private final CloudRunUrlService urlService;
     private final Predicate<String> instanceExists;
     private final LocationCatalog locations;
+    // A project's Compute resources, or null when Compute is not there to check Direct VPC egress.
+    private final Function<String, Map<String, ObjectNode>> computeResources;
     private final ExecutorService operationExecutor = Executors.newFixedThreadPool(
             Math.max(2, Runtime.getRuntime().availableProcessors()),
             runnable -> {
@@ -102,7 +108,8 @@ public class CloudRunService {
                            CloudRunRuntimeService runtimeService,
                            CloudRunUrlService urlService,
                            Instance<CloudRunInstancesService> instancesService,
-                           LocationCatalog locations) {
+                           LocationCatalog locations,
+                           Instance<ComputeService> computeService) {
         this.serviceStore = storageFactory.createGlobal("cloudrun-services", "cloudrun-services.json",
                 new TypeReference<Map<String, String>>() {});
         this.revisionStore = storageFactory.createGlobal("cloudrun-revisions", "cloudrun-revisions.json",
@@ -115,6 +122,7 @@ public class CloudRunService {
         this.urlService = urlService;
         this.instanceExists = name -> instancesService.get().instanceExists(name);
         this.locations = locations;
+        this.computeResources = config.services().compute().enabled() ? project -> computeService.get().resources(project) : null;
     }
 
     CloudRunService(StorageBackend<String, String> serviceStore,
@@ -151,6 +159,7 @@ public class CloudRunService {
         this.urlService = urlService;
         this.instanceExists = name -> false;
         this.locations = LocationCatalog.lenient();
+        this.computeResources = null;
     }
 
     void onStart(@Observes StartupEvent ev) {
@@ -193,6 +202,7 @@ public class CloudRunService {
             throw GcpException.alreadyExists("Resource '" + id + "' already exists.");
         }
         requireServiceAccount(requested.getTemplate().getServiceAccount());
+        requireVpcAccess(requested.getTemplate(), project, location);
 
         Timestamp now = timestampNow();
         String revisionName = name + "/revisions/" + id + "-00001";
@@ -251,6 +261,12 @@ public class CloudRunService {
                 throw GcpException.invalidArgument("Service account " + email + " does not exist");
             }
             throw e;
+        }
+    }
+
+    private void requireVpcAccess(RevisionTemplate template, String project, String location) {
+        if (computeResources != null && template.hasVpcAccess()) {
+            CloudRunVpcAccess.require(template.getVpcAccess(), project, location, computeResources);
         }
     }
 
@@ -327,6 +343,9 @@ public class CloudRunService {
         String serviceAccount = updated.getTemplate().getServiceAccount();
         if (!serviceAccount.equals(existing.getTemplate().getServiceAccount())) {
             requireServiceAccount(serviceAccount);
+        }
+        if (!updated.getTemplate().getVpcAccess().equals(existing.getTemplate().getVpcAccess())) {
+            requireVpcAccess(updated.getTemplate(), nameProject(name), nameLocation(name));
         }
         Revision revision = null;
 

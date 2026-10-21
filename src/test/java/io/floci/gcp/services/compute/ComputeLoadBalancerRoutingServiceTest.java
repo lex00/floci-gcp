@@ -31,6 +31,22 @@ class ComputeLoadBalancerRoutingServiceTest {
         assertEquals("default", ComputeLoadBalancerDataPlane.service(JSON.readTree("{\"defaultService\": \"default\"}"), "x", "/"));
     }
 
+    @Test void cloudArmorAppliesTheFirstMatchingRule() throws Exception {
+        JsonNode policy = JSON.readTree("""
+                {"rules": [
+                  {"priority": 10, "action": "deny(404)", "preview": true, "match": {"config": {"srcIpRanges": ["*"]}}},
+                  {"priority": 100, "action": "deny(403)", "match": {"config": {"srcIpRanges": ["10.0.0.0/8", "2001:db8::/32"]}}},
+                  {"priority": 200, "action": "allow", "match": {"config": {"srcIpRanges": ["10.1.0.0/16"]}}},
+                  {"priority": 2147483647, "action": "deny(502)", "match": {"config": {"srcIpRanges": ["*"]}}}]}
+                """);
+        assertEquals(403, ComputeLoadBalancerDataPlane.denial(policy, "10.1.2.3"));
+        assertEquals(403, ComputeLoadBalancerDataPlane.denial(policy, "2001:db8::5"));
+        assertEquals(502, ComputeLoadBalancerDataPlane.denial(policy, "192.168.0.1"));
+        assertEquals(0, ComputeLoadBalancerDataPlane.denial(JSON.readTree("{\"rules\": []}"), "192.168.0.1"));
+        assertFalse(ComputeSecurityResources.matches(JSON.readTree("[\"10.0.0.0/8\"]"), "11.0.0.1"));
+        assertFalse(ComputeSecurityResources.matches(JSON.readTree("[\"10.0.0.0/8\"]"), null));
+    }
+
     @Test void hostNameDropsThePort() {
         assertEquals("example.com", ComputeLoadBalancerDataPlane.hostName("Example.com:8080"));
         assertEquals("::1", ComputeLoadBalancerDataPlane.hostName("[::1]:80"));

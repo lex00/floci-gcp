@@ -18,7 +18,7 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
     private static final Set<String> UNCHECKED_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT", "SERVERLESS");
     private static final String FQDN = "(?=.{1,253}\\.?$)[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?)+\\.?";
     public boolean handles(String kind) {
-        return Set.of("networkEndpointGroups", "healthChecks", "backendServices", "urlMaps", "targetHttpProxies", "forwardingRules").contains(kind);
+        return Set.of("networkEndpointGroups", "healthChecks", "backendServices", "urlMaps", "targetHttpProxies", "targetHttpsProxies", "forwardingRules").contains(kind);
     }
     public void create(ComputeService.Context c, ObjectNode r) {
         validate(c, r, true);
@@ -68,6 +68,8 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
                     }
                 }
                 if (!Set.of("NONE", "CLIENT_IP", "GENERATED_COOKIE", "HTTP_COOKIE").contains(r.path("sessionAffinity").asText("NONE"))) { throw GcpException.unimplemented("Unsupported sessionAffinity"); }
+                if (r.hasNonNull("securityPolicy") && !r.path("securityPolicy").asText().isEmpty()) { c.reference(r, "securityPolicy", "securityPolicies"); }
+                else { r.remove("securityPolicy"); }
             }
             case "urlMaps" -> {
                 c.reference(r, "defaultService", "backendServices");
@@ -90,10 +92,14 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
                 }
             }
             case "targetHttpProxies" -> c.reference(r, "urlMap", "urlMaps");
+            case "targetHttpsProxies" -> {
+                c.reference(r, "urlMap", "urlMaps");
+                certificates(c, r);
+            }
             case "forwardingRules" -> {
                 if (!r.path("loadBalancingScheme").asText().equals("EXTERNAL_MANAGED") || !r.path("IPProtocol").asText("TCP").equals("TCP")) { throw GcpException.unimplemented("Only EXTERNAL_MANAGED TCP forwarding rules are supported"); }
                 r.put("IPProtocol", "TCP");
-                c.reference(r, "target", "targetHttpProxies");
+                target(c, r);
                 int[] ports = portRange(r);
                 if (!r.path("networkTier").asText("PREMIUM").equals("PREMIUM")) {
                     throw GcpException.invalidArgument("Global external forwarding rules require PREMIUM network tier");
@@ -213,11 +219,21 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
         if (r.has("fingerprint")) { r.put("fingerprint", fingerprint()); }
     }
     public void action(ComputeService.Context c, ObjectNode r, String action, ObjectNode body, Map<String,String> query) {
-        if (c.collection().equals("targetHttpProxies") && action.equals("setUrlMap")) {
+        if (c.collection().startsWith("targetHttp") && action.equals("setUrlMap")) {
             c.reference(body, "urlMap", "urlMaps"); r.set("urlMap", body.get("urlMap")); return;
         }
+        if (c.collection().equals("targetHttpsProxies") && action.equals("setSslCertificates")) {
+            certificates(c, body); r.set("sslCertificates", body.get("sslCertificates")); return;
+        }
         if (c.collection().equals("forwardingRules") && action.equals("setTarget")) {
-            c.reference(body, "target", "targetHttpProxies"); r.set("target", body.get("target")); return;
+            target(c, body); r.set("target", body.get("target")); return;
+        }
+        if (c.collection().equals("backendServices") && action.equals("setSecurityPolicy")) {
+            if (body.hasNonNull("securityPolicy") && !body.path("securityPolicy").asText().isEmpty()) {
+                c.reference(body, "securityPolicy", "securityPolicies"); r.set("securityPolicy", body.get("securityPolicy"));
+            } else { r.remove("securityPolicy"); }
+            r.put("fingerprint", fingerprint());
+            return;
         }
         if (!c.collection().equals("networkEndpointGroups") || !Set.of("attachNetworkEndpoints", "detachNetworkEndpoints").contains(action)) {
             ComputeResourceHandler.super.action(c, r, action, body, query); return;
@@ -252,6 +268,20 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
             throw GcpException.invalidArgument("A global external PREMIUM IPv4 address is required");
         }
         return address;
+    }
+    private static void target(ComputeService.Context c, ObjectNode r) {
+        c.reference(r, "target", required(r, "target").contains("targetHttpsProxies/") ? "targetHttpsProxies" : "targetHttpProxies");
+    }
+    private static void certificates(ComputeService.Context c, ObjectNode r) {
+        JsonNode links = r.path("sslCertificates");
+        if (!links.isArray() || links.isEmpty() || links.size() > 15) { throw GcpException.invalidArgument("sslCertificates takes 1 to 15 certificates"); }
+        ArrayNode resolved = object().putArray("sslCertificates");
+        for (JsonNode link : links) {
+            ObjectNode wrapper = object().put("certificate", link.asText());
+            c.reference(wrapper, "certificate", "sslCertificates");
+            resolved.add(wrapper.get("certificate"));
+        }
+        r.set("sslCertificates", resolved);
     }
     private static int[] portRange(ObjectNode r) {
         String[] values = required(r, "portRange").split("-", -1);

@@ -31,6 +31,8 @@ public class ComputeService {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Logger LOG = Logger.getLogger(ComputeService.class);
     private static final Pattern NAME = Pattern.compile("[a-z](?:[-a-z0-9]{0,61}[a-z0-9])?");
+    // Collections whose changes can alter what a load balancer port serves.
+    private static final Set<String> LISTENER_COLLECTIONS = Set.of("forwardingRules", "targetHttpsProxies", "sslCertificates");
     private static final Set<String> LABELLED = Set.of("instances", "disks", "images", "snapshots", "addresses", "forwardingRules");
     private final ProjectAwareStorageBackend<ComputeProject> store;
     private final EmulatorConfig config;
@@ -39,7 +41,7 @@ public class ComputeService {
     private final LocationCatalog locations;
     private final Event<ForwardingRulesChanged> forwardingRulesChanged;
 
-    /** Fired after a mutation of a project's forwarding rules has been saved. */
+    /** Fired after a saved mutation that can change what a load balancer port serves. */
     public record ForwardingRulesChanged(String project) {}
 
     @Inject
@@ -96,6 +98,8 @@ public class ComputeService {
         store.checkpoint();
     }
     private Context context(String project, String path, ComputeProject state) {
+        // Compute v1 serves targetHttpsProxies.setSslCertificates at projects/{project}/targetHttpsProxies/...
+        if (path.startsWith("targetHttpsProxies/")) { path = "global/" + path; }
         String[] parts = path.split("/");
         int index;
         String scope;
@@ -174,8 +178,11 @@ public class ComputeService {
                     .max(Comparator.comparing(r -> r.path("id").asLong()))
                     .orElseThrow(() -> GcpException.notFound("Image family not found")).deepCopy();
         }
+        if (c.collection().equals("securityPolicies") && "getRule".equals(c.action)) {
+            return ComputeSecurityResources.rule(c.require(c.key()), query).deepCopy();
+        }
         if (c.action != null) { throw GcpException.unimplemented("Unsupported read action: " + c.action); }
-        if (c.name() != null) { return c.require(c.key()).deepCopy(); }
+        if (c.name() != null) { return redacted(c.require(c.key()).deepCopy()); }
         List<ObjectNode> resources = c.state.resources.entrySet().stream()
                 .filter(e -> c.scope().equals("aggregated") ? e.getKey().matches("(?:zones|regions)/[^/]+/" + c.collection() + "/[^/]+")
                         : e.getKey().startsWith(c.scope() + "/" + c.collection() + "/"))
@@ -193,7 +200,16 @@ public class ComputeService {
             result.set("items", grouped);
             result.put("kind", "compute#" + singular(c.collection()) + "AggregatedList");
         }
-        return result;
+        return redacted(result);
+    }
+    // An SSL certificate's privateKey is write-only.
+    private static ObjectNode redacted(ObjectNode node) {
+        if (node.path("kind").asText().equals("compute#sslCertificate")) { node.remove("privateKey"); }
+        for (JsonNode child : node) {
+            if (child instanceof ObjectNode object) { redacted(object); }
+            else if (child.isArray()) { child.forEach(item -> { if (item instanceof ObjectNode object) { redacted(object); } }); }
+        }
+        return node;
     }
     public synchronized ObjectNode mutate(String project, String path, String verb, ObjectNode input, Map<String, String> query) {
         Context c = context(project, path, state(project));
@@ -299,7 +315,7 @@ public class ComputeService {
         if (requestId != null) { op.response.put("clientOperationId", requestId); c.state.requests.put(requestKey, operationKey); }
         c.state.operations.put(operationKey, op);
         save(project, c.state);
-        if (c.collection().equals("forwardingRules")) { forwardingRulesChanged.fire(new ForwardingRulesChanged(project)); }
+        if (LISTENER_COLLECTIONS.contains(c.collection())) { forwardingRulesChanged.fire(new ForwardingRulesChanged(project)); }
         return op.response.deepCopy();
     }
     private ComputeOperation operation(Context c) {
@@ -378,6 +394,7 @@ public class ComputeService {
     static String singular(String collection) {
         return switch (collection) {
             case "addresses" -> "address"; case "targetHttpProxies" -> "targetHttpProxy";
+            case "targetHttpsProxies" -> "targetHttpsProxy"; case "securityPolicies" -> "securityPolicy";
             case "urlMaps" -> "urlMap"; default -> collection.substring(0, collection.length() - 1);
         };
     }

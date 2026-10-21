@@ -106,14 +106,31 @@ Network endpoint groups support endpoint attach/detach/list at three scopes:
 zonal `GCE_VM_IP_PORT` (instance endpoints) and `NON_GCP_PRIVATE_IP_PORT`
 (`ipAddress` and `port`, with a required `network`), and global and regional
 `INTERNET_IP_PORT` (`ipAddress`) and `INTERNET_FQDN_PORT` (`fqdn`). An endpoint
-without `port` takes the group's `defaultPort`. A backend service whose backends are
-internet NEGs takes no health check. Global
+without `port` takes the group's `defaultPort`. Regional `SERVERLESS` groups name a
+`cloudRun`, `appEngine` or `cloudFunction` target and hold no endpoints. A backend
+service whose backends are internet or serverless NEGs takes no health check. Global
 HTTP health checks, EXTERNAL_MANAGED backend services, URL maps, HTTP target proxies
-and TCP forwarding rules support configuration and ordered cleanup. Backend and
-URL-map updates require current fingerprints. Path matchers, host rules, pathRules
-and session-affinity configuration are validated; actual request routing, health
-checks, TLS certificates, regional load balancing and advanced routeRules are not
-implemented. Endpoint membership is stored separately from the public NEG resource.
+and TCP forwarding rules support configuration and ordered cleanup. A forwarding
+rule without `IPProtocol` gets `TCP`. Backend and URL-map updates require current
+fingerprints. Path matchers, host rules, pathRules and session-affinity
+configuration are validated. Endpoint membership is stored separately from the
+public NEG resource.
+
+### Request routing
+
+floci-gcp opens the port of each forwarding rule whose `portRange` names a single
+port, on all interfaces of the emulator, and serves plain HTTP on it. A request
+follows the target HTTP proxy and the URL map (host rules, then the longest
+matching path rule, then the default service) to a backend service, and is proxied
+to the container of the first serverless NEG backend whose `cloudRun.service` has
+a ready revision. Requests get `X-Forwarded-For`, `X-Forwarded-Proto`,
+`X-Forwarded-Host` and `Via: 1.1 google`. Ports open and close as forwarding rules
+are created and deleted, and reopen on restart from stored rules. In Docker,
+publish the rule's port on the emulator container. When several rules share a
+port, the one whose `IPAddress` matches the request host serves it, otherwise the
+oldest. A rule on the emulator's own port is not served. Health checks, TLS,
+`cloudRun.urlMask`, `tag`, App Engine and Cloud Functions backends, internet and VM
+NEG backends, regional load balancing and advanced routeRules are not served.
 
 ### Address ownership and release
 

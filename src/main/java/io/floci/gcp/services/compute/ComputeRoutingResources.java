@@ -12,10 +12,10 @@ import static io.floci.gcp.services.compute.ComputeService.*;
 @ApplicationScoped
 public class ComputeRoutingResources implements ComputeResourceHandler {
     private static final Set<String> ZONAL_NEG_TYPES = Set.of("GCE_VM_IP_PORT", "NON_GCP_PRIVATE_IP_PORT");
-    private static final Set<String> REGIONAL_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
+    private static final Set<String> REGIONAL_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT", "SERVERLESS");
     private static final Set<String> GLOBAL_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
-    // Internet NEG backends take no health check.
-    private static final Set<String> UNCHECKED_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
+    // Internet and serverless NEG backends take no health check.
+    private static final Set<String> UNCHECKED_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT", "SERVERLESS");
     private static final String FQDN = "(?=.{1,253}\\.?$)[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?)+\\.?";
     public boolean handles(String kind) {
         return Set.of("networkEndpointGroups", "healthChecks", "backendServices", "urlMaps", "targetHttpProxies", "forwardingRules").contains(kind);
@@ -56,9 +56,9 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
                     backend.put("balancingMode", "RATE");
                     if (backend.path("maxRatePerEndpoint").asDouble(1) <= 0) { throw GcpException.invalidArgument("maxRatePerEndpoint must be positive"); }
                 }
-                if (unchecked > 0 && unchecked < backends.size()) { throw GcpException.invalidArgument("Internet NEG backends cannot be mixed with other backends"); }
+                if (unchecked > 0 && unchecked < backends.size()) { throw GcpException.invalidArgument("Internet and serverless NEG backends cannot be mixed with other backends"); }
                 if (unchecked > 0) {
-                    if (!r.path("healthChecks").isEmpty()) { throw GcpException.invalidArgument("Backend services with internet NEG backends take no health checks"); }
+                    if (!r.path("healthChecks").isEmpty()) { throw GcpException.invalidArgument("Backend services with internet or serverless NEG backends take no health checks"); }
                 } else {
                     if (!r.path("healthChecks").isArray() || r.path("healthChecks").size() != 1) { throw GcpException.invalidArgument("Exactly one health check is required"); }
                     ArrayNode checks = r.withArray("healthChecks");
@@ -91,7 +91,8 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
             }
             case "targetHttpProxies" -> c.reference(r, "urlMap", "urlMaps");
             case "forwardingRules" -> {
-                if (!r.path("loadBalancingScheme").asText().equals("EXTERNAL_MANAGED") || !r.path("IPProtocol").asText().equals("TCP")) { throw GcpException.unimplemented("Only EXTERNAL_MANAGED TCP forwarding rules are supported"); }
+                if (!r.path("loadBalancingScheme").asText().equals("EXTERNAL_MANAGED") || !r.path("IPProtocol").asText("TCP").equals("TCP")) { throw GcpException.unimplemented("Only EXTERNAL_MANAGED TCP forwarding rules are supported"); }
+                r.put("IPProtocol", "TCP");
                 c.reference(r, "target", "targetHttpProxies");
                 int[] ports = portRange(r);
                 if (!r.path("networkTier").asText("PREMIUM").equals("PREMIUM")) {
@@ -139,6 +140,17 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
                 String region = c.scope().substring(6, c.scope().lastIndexOf('-'));
                 if (!subnet.path("region").asText().equals(c.link("regions/" + region))) { throw GcpException.invalidArgument("NEG and subnet regions differ"); }
             }
+            case "SERVERLESS" -> {
+                for (String field : List.of("network", "subnetwork", "defaultPort")) {
+                    if (r.has(field)) { throw GcpException.invalidArgument("SERVERLESS network endpoint groups take no " + field); }
+                }
+                List<String> targets = List.of("cloudRun", "appEngine", "cloudFunction").stream().filter(r::has).toList();
+                if (targets.size() != 1) { throw GcpException.invalidArgument("Exactly one of cloudRun, appEngine or cloudFunction is required"); }
+                ObjectNode target = requireObject(r.get(targets.getFirst()), targets.getFirst());
+                if (targets.getFirst().equals("cloudRun") && !target.hasNonNull("service") && !target.hasNonNull("urlMask")) {
+                    throw GcpException.invalidArgument("cloudRun requires service or urlMask");
+                }
+            }
             case "NON_GCP_PRIVATE_IP_PORT" -> {
                 c.reference(r, "network", "networks");
                 if (r.has("subnetwork")) { throw GcpException.invalidArgument("NON_GCP_PRIVATE_IP_PORT network endpoint groups take no subnetwork"); }
@@ -154,6 +166,7 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
     }
     private static void endpoint(ComputeService.Context c, ObjectNode group, ObjectNode endpoint) {
         String type = group.path("networkEndpointType").asText();
+        if (type.equals("SERVERLESS")) { throw GcpException.invalidArgument("SERVERLESS network endpoint groups have no network endpoints"); }
         if (type.equals("GCE_VM_IP_PORT")) {
             if (endpoint.has("fqdn")) { throw GcpException.invalidArgument("GCE_VM_IP_PORT endpoints take no fqdn"); }
             if (endpoint.has("instance") && !endpoint.path("instance").asText().contains("/")) { endpoint.put("instance", c.scope() + "/instances/" + endpoint.path("instance").asText()); }

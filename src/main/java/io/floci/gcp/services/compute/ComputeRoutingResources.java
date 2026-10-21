@@ -1,14 +1,22 @@
 package io.floci.gcp.services.compute;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.gcp.core.common.GcpException;
 import jakarta.enterprise.context.ApplicationScoped;
+import java.net.InetAddress;
 import java.util.*;
 import static io.floci.gcp.services.compute.ComputeService.*;
 
 @ApplicationScoped
 public class ComputeRoutingResources implements ComputeResourceHandler {
+    private static final Set<String> ZONAL_NEG_TYPES = Set.of("GCE_VM_IP_PORT", "NON_GCP_PRIVATE_IP_PORT");
+    private static final Set<String> REGIONAL_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
+    private static final Set<String> GLOBAL_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
+    // Internet NEG backends take no health check.
+    private static final Set<String> UNCHECKED_NEG_TYPES = Set.of("INTERNET_IP_PORT", "INTERNET_FQDN_PORT");
+    private static final String FQDN = "(?=.{1,253}\\.?$)[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[-A-Za-z0-9]{0,61}[A-Za-z0-9])?)+\\.?";
     public boolean handles(String kind) {
         return Set.of("networkEndpointGroups", "healthChecks", "backendServices", "urlMaps", "targetHttpProxies", "forwardingRules").contains(kind);
     }
@@ -18,17 +26,7 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
         if (c.collection().equals("networkEndpointGroups")) { r.put("size", 0); c.state.endpoints.put(c.key(), new ArrayList<>()); }
     }
     private void validate(ComputeService.Context c, ObjectNode r, boolean creating) {
-        if (c.collection().equals("networkEndpointGroups")) {
-            c.scope("zones");
-            if (!r.path("networkEndpointType").asText().equals("GCE_VM_IP_PORT")) { throw GcpException.unimplemented("Only GCE_VM_IP_PORT network endpoints are implemented"); }
-            ObjectNode subnet = c.reference(r, "subnetwork", "subnetworks");
-            c.reference(r, "network", "networks");
-            if (!r.path("network").equals(subnet.path("network"))) { throw GcpException.invalidArgument("NEG network does not own subnet"); }
-            String region = c.scope().substring(6, c.scope().lastIndexOf('-'));
-            if (!subnet.path("region").asText().equals(c.link("regions/" + region))) { throw GcpException.invalidArgument("NEG and subnet regions differ"); }
-            if (r.has("defaultPort")) { port(r.path("defaultPort")); }
-            return;
-        }
+        if (c.collection().equals("networkEndpointGroups")) { endpointGroup(c, r); return; }
         c.scope("global");
         switch (c.collection()) {
             case "healthChecks" -> {
@@ -43,19 +41,31 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
                 if (!r.path("loadBalancingScheme").asText("EXTERNAL_MANAGED").equals("EXTERNAL_MANAGED")
                         || !r.path("protocol").asText("HTTP").equals("HTTP")) { throw GcpException.unimplemented("Only global external managed HTTP backends are supported"); }
                 r.put("loadBalancingScheme", "EXTERNAL_MANAGED").put("protocol", "HTTP");
-                if (!r.path("healthChecks").isArray() || r.path("healthChecks").size() != 1) { throw GcpException.invalidArgument("Exactly one health check is required"); }
-                var checks = r.withArray("healthChecks");
-                for (int i = 0; i < checks.size(); i++) {
-                    ObjectNode wrapper = object().put("check", checks.get(i).asText());
-                    c.reference(wrapper, "check", "healthChecks"); checks.set(i, wrapper.get("check"));
-                }
                 Set<String> groups = new HashSet<>();
-                for (ObjectNode backend : objectArray(r, "backends")) {
+                int unchecked = 0;
+                List<ObjectNode> backends = objectArray(r, "backends");
+                for (ObjectNode backend : backends) {
                     ObjectNode group = c.reference(backend, "group", "networkEndpointGroups");
                     if (!groups.add(group.path("selfLink").asText())) { throw GcpException.invalidArgument("Duplicate backend group"); }
+                    if (UNCHECKED_NEG_TYPES.contains(group.path("networkEndpointType").asText())) {
+                        unchecked++;
+                        if (!backend.path("balancingMode").asText("UTILIZATION").matches("RATE|UTILIZATION")) { throw GcpException.unimplemented("Unsupported backend balancingMode"); }
+                        continue;
+                    }
                     if (!backend.path("balancingMode").asText("RATE").equals("RATE")) { throw GcpException.unimplemented("Only RATE backend balancing is supported"); }
                     backend.put("balancingMode", "RATE");
                     if (backend.path("maxRatePerEndpoint").asDouble(1) <= 0) { throw GcpException.invalidArgument("maxRatePerEndpoint must be positive"); }
+                }
+                if (unchecked > 0 && unchecked < backends.size()) { throw GcpException.invalidArgument("Internet NEG backends cannot be mixed with other backends"); }
+                if (unchecked > 0) {
+                    if (!r.path("healthChecks").isEmpty()) { throw GcpException.invalidArgument("Backend services with internet NEG backends take no health checks"); }
+                } else {
+                    if (!r.path("healthChecks").isArray() || r.path("healthChecks").size() != 1) { throw GcpException.invalidArgument("Exactly one health check is required"); }
+                    ArrayNode checks = r.withArray("healthChecks");
+                    for (int i = 0; i < checks.size(); i++) {
+                        ObjectNode wrapper = object().put("check", checks.get(i).asText());
+                        c.reference(wrapper, "check", "healthChecks"); checks.set(i, wrapper.get("check"));
+                    }
                 }
                 if (!Set.of("NONE", "CLIENT_IP", "GENERATED_COOKIE", "HTTP_COOKIE").contains(r.path("sessionAffinity").asText("NONE"))) { throw GcpException.unimplemented("Unsupported sessionAffinity"); }
             }
@@ -114,6 +124,65 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
             default -> throw GcpException.unimplemented("Unknown routing resource");
         }
     }
+    private void endpointGroup(ComputeService.Context c, ObjectNode r) {
+        boolean zonal = c.scope().startsWith("zones/"), regional = c.scope().startsWith("regions/");
+        Set<String> types = zonal ? ZONAL_NEG_TYPES : regional ? REGIONAL_NEG_TYPES : c.scope().equals("global") ? GLOBAL_NEG_TYPES : Set.of();
+        if (types.isEmpty()) { throw GcpException.invalidArgument("Invalid scope for networkEndpointGroups"); }
+        String type = r.path("networkEndpointType").asText(zonal ? "GCE_VM_IP_PORT" : "");
+        if (!types.contains(type)) { throw GcpException.unimplemented("networkEndpointType " + type + " is not implemented for " + c.scope()); }
+        r.put("networkEndpointType", type);
+        switch (type) {
+            case "GCE_VM_IP_PORT" -> {
+                ObjectNode subnet = c.reference(r, "subnetwork", "subnetworks");
+                c.reference(r, "network", "networks");
+                if (!r.path("network").equals(subnet.path("network"))) { throw GcpException.invalidArgument("NEG network does not own subnet"); }
+                String region = c.scope().substring(6, c.scope().lastIndexOf('-'));
+                if (!subnet.path("region").asText().equals(c.link("regions/" + region))) { throw GcpException.invalidArgument("NEG and subnet regions differ"); }
+            }
+            case "NON_GCP_PRIVATE_IP_PORT" -> {
+                c.reference(r, "network", "networks");
+                if (r.has("subnetwork")) { throw GcpException.invalidArgument("NON_GCP_PRIVATE_IP_PORT network endpoint groups take no subnetwork"); }
+            }
+            default -> {
+                if (r.has("subnetwork") || (!regional && r.has("network"))) {
+                    throw GcpException.invalidArgument(type + " network endpoint groups in " + c.scope() + " take no " + (r.has("subnetwork") ? "subnetwork" : "network"));
+                }
+                if (r.has("network")) { c.reference(r, "network", "networks"); }
+            }
+        }
+        if (r.has("defaultPort")) { port(r.path("defaultPort")); }
+    }
+    private static void endpoint(ComputeService.Context c, ObjectNode group, ObjectNode endpoint) {
+        String type = group.path("networkEndpointType").asText();
+        if (type.equals("GCE_VM_IP_PORT")) {
+            if (endpoint.has("fqdn")) { throw GcpException.invalidArgument("GCE_VM_IP_PORT endpoints take no fqdn"); }
+            if (endpoint.has("instance") && !endpoint.path("instance").asText().contains("/")) { endpoint.put("instance", c.scope() + "/instances/" + endpoint.path("instance").asText()); }
+            ObjectNode vm = c.reference(endpoint, "instance", "instances");
+            if (!vm.path("zone").asText().equals(c.link(c.scope()))) { throw GcpException.invalidArgument("Endpoint and VM zones differ"); }
+            JsonNode nic = vm.path("networkInterfaces").get(0);
+            if (!nic.path("network").equals(group.path("network")) || !nic.path("subnetwork").equals(group.path("subnetwork"))) { throw GcpException.invalidArgument("Endpoint is outside NEG network/subnet"); }
+            if (!endpoint.has("ipAddress")) { endpoint.put("ipAddress", nic.path("networkIP").asText()); }
+            if (!endpoint.path("ipAddress").equals(nic.path("networkIP"))) { throw GcpException.invalidArgument("Endpoint IP does not belong to instance"); }
+        } else {
+            if (endpoint.has("instance")) { throw GcpException.invalidArgument(type + " endpoints take no instance"); }
+            if (type.equals("INTERNET_FQDN_PORT")) {
+                if (endpoint.has("ipAddress")) { throw GcpException.invalidArgument("INTERNET_FQDN_PORT endpoints take no ipAddress"); }
+                if (!required(endpoint, "fqdn").matches(FQDN)) { throw GcpException.invalidArgument("Invalid fqdn"); }
+            } else {
+                if (endpoint.has("fqdn")) { throw GcpException.invalidArgument(type + " endpoints take no fqdn"); }
+                ipAddress(required(endpoint, "ipAddress"));
+            }
+        }
+        if (!endpoint.has("port") && group.has("defaultPort")) { endpoint.set("port", group.get("defaultPort")); }
+        port(endpoint.path("port"));
+    }
+    private static void ipAddress(String value) {
+        try {
+            InetAddress.ofLiteral(value);
+        } catch (IllegalArgumentException e) {
+            throw GcpException.invalidArgument("Invalid ipAddress: " + value);
+        }
+    }
     public void update(ComputeService.Context c, ObjectNode r, ObjectNode body, String verb) {
         if (c.collection().equals("networkEndpointGroups")) { ComputeResourceHandler.super.update(c, r, body, verb); return; }
         if (r.has("fingerprint")) { checkFingerprint(r, body, "fingerprint"); }
@@ -143,15 +212,7 @@ public class ComputeRoutingResources implements ComputeResourceHandler {
         List<ObjectNode> endpoints = c.state.endpoints.get(c.key());
         if (!body.path("networkEndpoints").isArray() || body.path("networkEndpoints").isEmpty()) { throw GcpException.invalidArgument("networkEndpoints are required"); }
         for (ObjectNode endpoint : objectArray(body, "networkEndpoints")) {
-            if (endpoint.has("instance") && !endpoint.path("instance").asText().contains("/")) { endpoint.put("instance", c.scope() + "/instances/" + endpoint.path("instance").asText()); }
-            ObjectNode vm = c.reference(endpoint, "instance", "instances");
-            if (!vm.path("zone").asText().equals(c.link(c.scope()))) { throw GcpException.invalidArgument("Endpoint and VM zones differ"); }
-            JsonNode nic = vm.path("networkInterfaces").get(0);
-            if (!nic.path("network").equals(r.path("network")) || !nic.path("subnetwork").equals(r.path("subnetwork"))) { throw GcpException.invalidArgument("Endpoint is outside NEG network/subnet"); }
-            if (!endpoint.has("ipAddress")) { endpoint.put("ipAddress", nic.path("networkIP").asText()); }
-            if (!endpoint.path("ipAddress").equals(nic.path("networkIP"))) { throw GcpException.invalidArgument("Endpoint IP does not belong to instance"); }
-            if (!endpoint.has("port") && r.has("defaultPort")) { endpoint.set("port", r.get("defaultPort")); }
-            port(endpoint.path("port"));
+            endpoint(c, r, endpoint);
             if (action.equals("attachNetworkEndpoints")) {
                 if (!endpoints.contains(endpoint)) { endpoints.add(endpoint.deepCopy()); }
             } else if (!endpoints.remove(endpoint)) { throw GcpException.notFound("Network endpoint not found"); }
